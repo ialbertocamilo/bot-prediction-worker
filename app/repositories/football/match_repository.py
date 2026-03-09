@@ -151,3 +151,44 @@ class MatchRepository:
             .order_by(Match.utc_date.asc())
         )
         return list(self.db.scalars(stmt).all())
+
+    def list_finished_by_league(
+        self,
+        league_id: int,
+        limit: int | None = None,
+    ) -> list[Match]:
+        stmt = (
+            select(Match)
+            .where(Match.league_id == league_id)
+            .where(Match.status == "FINISHED")
+            .where(Match.home_goals.isnot(None))
+            .where(Match.away_goals.isnot(None))
+            .order_by(Match.utc_date.desc())
+        )
+        if limit:
+            stmt = stmt.limit(limit)
+        return list(self.db.scalars(stmt).all())
+
+    def list_by_date_range(
+        self,
+        date_from: datetime,
+        date_to: datetime,
+        league_id: int | None = None,
+    ) -> list[Match]:
+        stmt = (
+            select(Match)
+            .where(Match.utc_date >= date_from)
+            .where(Match.utc_date <= date_to)
+            .order_by(Match.utc_date.asc())
+        )
+        if league_id is not None:
+            stmt = stmt.where(Match.league_id == league_id)
+        return list(self.db.scalars(stmt).all())
+
+    def list_live(self) -> list[Match]:
+        stmt = (
+            select(Match)
+            .where(Match.status.in_(["IN_PLAY", "PAUSED"]))
+            .order_by(Match.utc_date.asc())
+        )
+        return list(self.db.scalars(stmt).all())

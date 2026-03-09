@@ -30,6 +30,11 @@ class ApiFootballClient:
         )
         response.raise_for_status()
         payload: dict[str, Any] = response.json()
+
+        errors: Any = payload.get("errors")
+        if errors and (isinstance(errors, dict) and errors or isinstance(errors, list) and len(errors) > 0):
+            raise RuntimeError(f"API-Football devolvió errores: {errors}")
+
         return payload
 
     def get_fixtures(

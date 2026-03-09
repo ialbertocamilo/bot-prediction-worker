@@ -24,8 +24,16 @@ def main() -> None:
 
     provider = ProviderFactory.create(provider_name)
 
-    date_from: date = date.today()
-    date_to: date = date.today() + timedelta(days=7)
+    date_from_raw: str | None = os.getenv("SYNC_DATE_FROM")
+    date_to_raw: str | None = os.getenv("SYNC_DATE_TO")
+    days_ahead: int = int(os.getenv("SYNC_DAYS_AHEAD", "7"))
+
+    date_from: date = date.fromisoformat(date_from_raw) if date_from_raw else date.today()
+    date_to: date = date.fromisoformat(date_to_raw) if date_to_raw else date_from + timedelta(days=days_ahead)
+
+    print(f"Proveedor: {provider_name}")
+    print(f"Liga: {league_id} | Temporada: {season}")
+    print(f"Rango: {date_from.isoformat()} → {date_to.isoformat()}")
 
     matches = provider.get_fixtures(
         league_id=league_id,
@@ -33,6 +41,8 @@ def main() -> None:
         date_from=date_from,
         date_to=date_to,
     )
+
+    print(f"Partidos recibidos del proveedor: {len(matches)}")
 
     db = SessionLocal()
     try:
