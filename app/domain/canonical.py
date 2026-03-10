@@ -5,7 +5,7 @@ from typing import Any, Optional, Literal
 
 from pydantic import BaseModel, Field, ConfigDict
 
-from app.domain.enums import MatchStatus, EventType
+from app.domain.enums import MatchStatus, EventType, PlayerPosition, FootPreference
 
 
 class CanonicalBase(BaseModel):
@@ -113,3 +113,39 @@ class MatchPredictionResponse(CanonicalBase):
     utc_date: datetime
     prediction: Prediction1X2
     notes: str | None = None
+
+
+class CanonicalPlayer(CanonicalBase):
+    name: str = Field(min_length=1)
+    date_of_birth: date | None = None
+    nationality: str | None = None
+    position: PlayerPosition = PlayerPosition.unknown
+    height_cm: int | None = None
+    weight_kg: int | None = None
+    foot: FootPreference = FootPreference.unknown
+    team_name: str | None = None
+    jersey_number: int | None = None
+    market_value_eur: int | None = None
+    contract_until: date | None = None
+
+    source_ref: CanonicalSourceRef | None = None
+
+
+class CanonicalMatchStats(CanonicalBase):
+    match_external_id: str = Field(min_length=1)
+    team_name: str = Field(min_length=1)
+
+    possession_pct: float | None = None
+    shots: int | None = None
+    shots_on_target: int | None = None
+    xg: float | None = None
+    xga: float | None = None
+    corners: int | None = None
+    fouls: int | None = None
+    offsides: int | None = None
+    yellow_cards: int | None = None
+    red_cards: int | None = None
+    passes: int | None = None
+    pass_accuracy_pct: float | None = None
+
+    source_ref: CanonicalSourceRef | None = None

@@ -7,6 +7,7 @@ import logging
 import math
 from datetime import datetime, timezone
 
+from scipy.stats import poisson as poisson_dist
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -145,13 +146,15 @@ class PredictionService:
 
     @staticmethod
     def _to_dict(pred, match: Match) -> dict:
-        return {
+        d = {
             "match_id": match.id,
             "home_team": match.home_team.name if match.home_team else "?",
             "away_team": match.away_team.name if match.away_team else "?",
             "home_team_id": match.home_team_id,
             "away_team_id": match.away_team_id,
             "league": match.league.name if match.league else "?",
+            "utc_date": match.utc_date,
+            "status": match.status,
             "p_home": pred.p_home,
             "p_draw": pred.p_draw,
             "p_away": pred.p_away,
@@ -164,4 +167,24 @@ class PredictionService:
             "top_scorelines": pred.top_scorelines,
             "model": MODEL_NAME,
             "data_quality": pred.data_quality,
+            # Double chance — derived from 1X2
+            "p_1x": round(pred.p_home + pred.p_draw, 4),
+            "p_x2": round(pred.p_draw + pred.p_away, 4),
+            "p_12": round(pred.p_home + pred.p_away, 4),
         }
+        # Compute O/U 1.5 and 3.5 from stored xG using Poisson approximation
+        if pred.xg_home is not None and pred.xg_away is not None:
+            lh, la = pred.xg_home, pred.xg_away
+            p_u15 = sum(
+                float(poisson_dist.pmf(i, lh) * poisson_dist.pmf(j, la))
+                for i in range(11) for j in range(11) if i + j <= 1
+            )
+            p_u35 = sum(
+                float(poisson_dist.pmf(i, lh) * poisson_dist.pmf(j, la))
+                for i in range(11) for j in range(11) if i + j <= 3
+            )
+            d["p_over_1_5"] = round(1.0 - p_u15, 4)
+            d["p_under_1_5"] = round(p_u15, 4)
+            d["p_over_3_5"] = round(1.0 - p_u35, 4)
+            d["p_under_3_5"] = round(p_u35, 4)
+        return d

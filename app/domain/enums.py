@@ -34,3 +34,18 @@ class EventType(str, Enum):
     substitution = "SUBSTITUTION"
     var = "VAR"
     other = "OTHER"
+
+
+class PlayerPosition(str, Enum):
+    goalkeeper = "GOALKEEPER"
+    defender = "DEFENDER"
+    midfielder = "MIDFIELDER"
+    forward = "FORWARD"
+    unknown = "UNKNOWN"
+
+
+class FootPreference(str, Enum):
+    left = "LEFT"
+    right = "RIGHT"
+    both = "BOTH"
+    unknown = "UNKNOWN"

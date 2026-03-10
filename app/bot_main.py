@@ -8,7 +8,8 @@ Comandos:
     /partidos    — Partidos recientes y próximos
     /partido <id>— Detalle de un partido
     /vivo        — Partidos en vivo
-    /prediccion <id> — Predicción Dixon-Coles
+    /prediccion <id> [cuota_L cuota_E cuota_V] — Predicción + análisis de valor
+    /proximos [id_liga] — Próximos partidos con predicciones
 """
 from __future__ import annotations
 
@@ -23,10 +24,13 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 from app.db.models.football.match import Match
+from app.db.models.prediction.prediction import Prediction
 from app.db.session import SessionLocal
 from app.repositories.football.league_repository import LeagueRepository
 from app.repositories.football.match_event_repository import MatchEventRepository
 from app.repositories.football.match_repository import MatchRepository
+from app.repositories.prediction.model_repository import ModelRepository
+from app.repositories.prediction.prediction_repository import PredictionRepository
 from app.services.prediction.prediction_service import PredictionService
 
 load_dotenv()
@@ -87,15 +91,18 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = (
         f"Hola {user.first_name or 'Usuario'}.\n\n"
         "Soy un bot de estadísticas de fútbol con predicciones Dixon-Coles.\n\n"
-        "Comandos:\n"
+        "📊 <b>Comandos generales:</b>\n"
         "/ligas — Ligas disponibles\n"
-        "/tabla <id_liga> — Tabla de posiciones\n"
+        "/tabla &lt;id_liga&gt; — Tabla de posiciones\n"
         "/partidos [id_liga] — Partidos recientes y próximos\n"
-        "/partido <id> — Detalle de un partido\n"
-        "/vivo — Partidos en vivo\n"
-        "/prediccion <id> — Predicción Dixon-Coles\n"
+        "/partido &lt;id&gt; — Detalle de un partido\n"
+        "/vivo — Partidos en vivo\n\n"
+        "🤖 <b>Predicciones y apuestas:</b>\n"
+        "/prediccion &lt;id&gt; — Predicción completa\n"
+        "/prediccion &lt;id&gt; 1.85 3.40 4.50 — Con análisis de valor\n"
+        "/proximos [id_liga] — Próximos partidos con predicción\n"
     )
-    await update.message.reply_text(msg)
+    await update.message.reply_text(msg, parse_mode="HTML")
 
 
 async def cmd_ligas(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -301,14 +308,41 @@ async def cmd_vivo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_prediccion(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Predicción completa. Acepta cuotas opcionales para análisis de valor.
+
+    /prediccion <id>
+    /prediccion <id> 1.85 3.40 4.50
+    """
     if not context.args:
-        await update.message.reply_text("Uso: /prediccion <id_partido>")
+        await update.message.reply_text(
+            "Uso: /prediccion &lt;id&gt; [cuota_L cuota_E cuota_V]\n\n"
+            "Ejemplos:\n"
+            "  /prediccion 42\n"
+            "  /prediccion 42 1.85 3.40 4.50",
+            parse_mode="HTML",
+        )
         return
     try:
         match_id = int(context.args[0])
     except ValueError:
         await update.message.reply_text("El ID debe ser un número.")
         return
+
+    # Parse optional bookmaker odds
+    odds: dict[str, float] | None = None
+    if len(context.args) >= 4:
+        try:
+            odds = {
+                "home": float(context.args[1]),
+                "draw": float(context.args[2]),
+                "away": float(context.args[3]),
+            }
+        except ValueError:
+            await update.message.reply_text(
+                "Las cuotas deben ser números decimales.\n"
+                "Ejemplo: /prediccion 42 1.85 3.40 4.50"
+            )
+            return
 
     await update.message.reply_text("⏳ Calculando predicción Dixon-Coles…")
 
@@ -327,60 +361,309 @@ async def cmd_prediccion(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         home = _escape_html(result["home_team"])
         away = _escape_html(result["away_team"])
-        p_h = result["p_home"] * 100
-        p_d = result["p_draw"] * 100
-        p_a = result["p_away"] * 100
+        p_h = result["p_home"]
+        p_d = result["p_draw"]
+        p_a = result["p_away"]
 
+        # Determine winner
         if p_h >= p_d and p_h >= p_a:
-            winner, conf, icon = home, p_h, "🏠"
+            winner, conf = home, p_h
+            tip = "1"
         elif p_a >= p_d:
-            winner, conf, icon = away, p_a, "✈️"
+            winner, conf = away, p_a
+            tip = "2"
         else:
-            winner, conf, icon = "Empate", p_d, "🤝"
-
-        xg_h = result.get("xg_home", 0)
-        xg_a = result.get("xg_away", 0)
+            winner, conf = "Empate", p_d
+            tip = "X"
 
         lines = [
             "📈 <b>Predicción Dixon-Coles</b>",
-            "─────────────────────",
+            "═══════════════════════",
             f"<b>{home}</b>  vs  <b>{away}</b>",
             f"📊 {_escape_html(result.get('league', ''))}",
-            "─────────────────────",
-            f"{icon} <b>Predicción: {winner} ({conf:.1f}%)</b>",
-            "",
-            "Probabilidades 1X2:",
-            f"  🏠 Local:     <b>{p_h:.1f}%</b>",
-            f"  🤝 Empate:    <b>{p_d:.1f}%</b>",
-            f"  ✈️ Visitante: <b>{p_a:.1f}%</b>",
-            "",
-            f"📉 xG Local: {xg_h:.2f} | xG Visitante: {xg_a:.2f}",
         ]
 
+        if result.get("utc_date"):
+            lines.append(f"📅 {result['utc_date'].strftime('%d/%m/%Y %H:%M UTC')}")
+
+        lines.append("═══════════════════════")
+
+        # Main tip with confidence
+        lines.append(
+            f"\n🎯 <b>Predicción: {tip} — {winner}</b> "
+            f"({conf * 100:.1f}%)"
+        )
+        lines.append(f"   Confianza: {_confidence_label(conf)}")
+
+        # 1X2 probabilities with fair odds
+        lines.append("\n📊 <b>Mercado 1X2:</b>")
+        lines.append(
+            f"  🏠 Local:     {p_h * 100:.1f}%  "
+            f"(justa: {_prob_to_decimal_odds(p_h)})"
+        )
+        lines.append(
+            f"  🤝 Empate:    {p_d * 100:.1f}%  "
+            f"(justa: {_prob_to_decimal_odds(p_d)})"
+        )
+        lines.append(
+            f"  ✈️ Visitante: {p_a * 100:.1f}%  "
+            f"(justa: {_prob_to_decimal_odds(p_a)})"
+        )
+
+        # xG
+        xg_h = result.get("xg_home", 0)
+        xg_a = result.get("xg_away", 0)
+        lines.append(f"\n⚽ xG: {home} {xg_h:.2f} — {xg_a:.2f} {away}")
+
+        # Over/Under markets
+        lines.append("\n📈 <b>Goles totales:</b>")
+        if result.get("p_over_1_5") is not None:
+            lines.append(
+                f"  Over 1.5: {result['p_over_1_5'] * 100:.1f}% | "
+                f"Under 1.5: {result['p_under_1_5'] * 100:.1f}%"
+            )
         if result.get("p_over_2_5") is not None:
-            o25 = result["p_over_2_5"] * 100
-            u25 = result["p_under_2_5"] * 100
-            lines.append(f"⚽ Over 2.5: {o25:.1f}% | Under 2.5: {u25:.1f}%")
+            lines.append(
+                f"  Over 2.5: {result['p_over_2_5'] * 100:.1f}% | "
+                f"Under 2.5: {result['p_under_2_5'] * 100:.1f}%"
+            )
+        if result.get("p_over_3_5") is not None:
+            lines.append(
+                f"  Over 3.5: {result['p_over_3_5'] * 100:.1f}% | "
+                f"Under 3.5: {result['p_under_3_5'] * 100:.1f}%"
+            )
 
+        # BTTS
         if result.get("p_btts_yes") is not None:
-            by = result["p_btts_yes"] * 100
-            bn = result["p_btts_no"] * 100
-            lines.append(f"🎯 Ambos marcan: Sí {by:.1f}% | No {bn:.1f}%")
+            lines.append(
+                f"\n🎯 <b>Ambos marcan:</b> Sí {result['p_btts_yes'] * 100:.1f}% "
+                f"| No {result['p_btts_no'] * 100:.1f}%"
+            )
 
+        # Double chance
+        if result.get("p_1x") is not None:
+            lines.append("\n🔀 <b>Doble oportunidad:</b>")
+            lines.append(
+                f"  1X: {result['p_1x'] * 100:.1f}% | "
+                f"X2: {result['p_x2'] * 100:.1f}% | "
+                f"12: {result['p_12'] * 100:.1f}%"
+            )
+
+        # Top scorelines
         top = result.get("top_scorelines")
         if top:
             lines.append("\n🔢 <b>Marcadores más probables:</b>")
             for score, pct in list(top.items())[:5]:
                 lines.append(f"  {score}: {pct}%")
 
-        lines.append(f"\n🤖 Modelo: {result.get('model', 'Dixon-Coles')}")
+        # ── Value analysis (when bookmaker odds are provided) ──
+        if odds:
+            lines.append("\n═══════════════════════")
+            lines.append("💎 <b>ANÁLISIS DE VALOR</b>")
+            lines.append("═══════════════════════")
+
+            markets = [
+                ("1 (Local)", p_h, odds["home"]),
+                ("X (Empate)", p_d, odds["draw"]),
+                ("2 (Visitante)", p_a, odds["away"]),
+            ]
+
+            value_found = False
+            for name, prob, odd in markets:
+                implied = _implied_prob(odd)
+                ev = _expected_value(prob, odd)
+                kelly = _kelly_fraction(prob, odd)
+                edge = prob - implied
+
+                is_value = ev > 0
+                icon = "✅" if is_value else "❌"
+
+                lines.append(f"\n{icon} <b>{name}</b> — Cuota: {odd}")
+                lines.append(
+                    f"   Modelo: {prob * 100:.1f}% vs "
+                    f"Casa: {implied * 100:.1f}%"
+                )
+                lines.append(f"   Ventaja: {edge * 100:+.1f}%")
+                lines.append(f"   EV: {ev * 100:+.1f}%")
+
+                if is_value:
+                    value_found = True
+                    quarter_k = kelly * 0.25
+                    lines.append(
+                        f"   🏦 Kelly: {kelly * 100:.1f}% "
+                        f"(conservador ¼K: {quarter_k * 100:.1f}%)"
+                    )
+
+            if value_found:
+                lines.append(
+                    "\n💡 <i>✅ = Apuesta de valor. "
+                    "EV positivo = la cuota de la casa "
+                    "supera la probabilidad real.</i>"
+                )
+            else:
+                lines.append(
+                    "\n⚠️ <i>No se detectaron apuestas de valor.</i>"
+                )
+
+            lines.append(
+                "\n⚠️ <i>Kelly% = fracción del bankroll. "
+                "Usa ¼K para ser conservador.</i>"
+            )
+        else:
+            lines.append(
+                "\n💡 <i>Agrega cuotas para análisis de valor:</i>\n"
+                f"/prediccion {match_id} cuota_L cuota_E cuota_V"
+            )
+
+        lines.append(f"\n🤖 {result.get('model', 'Dixon-Coles')}")
         if result.get("data_quality"):
             lines.append(f"📋 Datos: {result['data_quality']}")
 
-        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+        text = "\n".join(lines)
+        if len(text) > 4000:
+            text = text[:3950] + "\n…"
+        await update.message.reply_text(text, parse_mode="HTML")
     except Exception:
         logger.exception("Error en /prediccion %s", match_id)
         await update.message.reply_text("Error al generar la predicción.")
+    finally:
+        db.close()
+
+
+# ── Betting helpers ───────────────────────────────────────────────────────
+
+def _prob_to_decimal_odds(prob: float) -> float:
+    """Convert probability to fair decimal odds."""
+    if prob <= 0:
+        return 99.0
+    return round(1.0 / prob, 2)
+
+
+def _implied_prob(decimal_odds: float) -> float:
+    """Convert decimal odds to implied probability."""
+    if decimal_odds <= 0:
+        return 0.0
+    return 1.0 / decimal_odds
+
+
+def _kelly_fraction(prob: float, odds: float) -> float:
+    """Kelly criterion: optimal fraction of bankroll.
+    f* = (bp - q) / b  where b = odds - 1, p = model prob, q = 1 - p
+    """
+    b = odds - 1.0
+    if b <= 0:
+        return 0.0
+    q = 1.0 - prob
+    f = (b * prob - q) / b
+    return max(f, 0.0)
+
+
+def _expected_value(prob: float, odds: float) -> float:
+    """EV = prob * (odds - 1) - (1 - prob).  Positive = value bet."""
+    return prob * (odds - 1.0) - (1.0 - prob)
+
+
+def _confidence_label(prob: float) -> str:
+    if prob >= 0.70:
+        return "🟢 Alta"
+    if prob >= 0.50:
+        return "🟡 Media"
+    if prob >= 0.35:
+        return "🟠 Baja"
+    return "🔴 Muy baja"
+
+
+# ── /proximos ─────────────────────────────────────────────────────────────
+
+async def cmd_proximos(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Upcoming matches with pre-computed prediction summaries."""
+    db = _db()
+    try:
+        league_id: int | None = None
+        if context.args:
+            try:
+                league_id = int(context.args[0])
+            except ValueError:
+                pass
+
+        now = datetime.now(timezone.utc)
+        date_to = now + timedelta(days=7)
+
+        matches = MatchRepository(db).list_by_date_range(
+            date_from=now,
+            date_to=date_to,
+            league_id=league_id,
+        )
+        # Only show scheduled / not-yet-played
+        matches = [m for m in matches if m.status in ("SCHEDULED", "NS")]
+
+        if not matches:
+            await update.message.reply_text(
+                "No hay partidos próximos programados.\n"
+                "Ejecuta el worker para sincronizar fixtures."
+            )
+            return
+
+        # Try to grab cached predictions
+        model_rec = ModelRepository(db).get_by_name("dixon_coles_v1")
+        pred_repo = PredictionRepository(db)
+
+        lines = ["⚽ <b>Próximos partidos con predicción</b>\n"]
+        current_league = ""
+
+        for m in matches[:30]:
+            league_name = m.league.name if m.league else "?"
+            if league_name != current_league:
+                current_league = league_name
+                lines.append(f"\n<b>{_escape_html(league_name)}</b>")
+
+            home = _escape_html(m.home_team.name if m.home_team else "?")
+            away = _escape_html(m.away_team.name if m.away_team else "?")
+            date_str = m.utc_date.strftime("%d/%m %H:%M") if m.utc_date else "?"
+
+            # Check for cached prediction
+            pred: Prediction | None = None
+            if model_rec:
+                pred = pred_repo.latest_for_match_and_model(m.id, model_rec.id)
+
+            if pred:
+                ph = pred.p_home * 100
+                pd_ = pred.p_draw * 100
+                pa = pred.p_away * 100
+                # Determine favorite
+                if ph >= pd_ and ph >= pa:
+                    tip = f"1 ({ph:.0f}%)"
+                elif pa >= pd_:
+                    tip = f"2 ({pa:.0f}%)"
+                else:
+                    tip = f"X ({pd_:.0f}%)"
+                odds_h = _prob_to_decimal_odds(pred.p_home)
+                odds_a = _prob_to_decimal_odds(pred.p_away)
+                lines.append(
+                    f"  🕐 {home} vs {away}"
+                )
+                lines.append(
+                    f"      {date_str} UTC · <b>Tip: {tip}</b>"
+                )
+                lines.append(
+                    f"      Cuotas justas: {odds_h} / "
+                    f"{_prob_to_decimal_odds(pred.p_draw)} / {odds_a}"
+                )
+            else:
+                lines.append(f"  🕐 {home} vs {away}")
+                lines.append(f"      {date_str} UTC · Sin predicción aún")
+
+            lines.append(f"      /prediccion {m.id}")
+
+        lines.append(
+            "\n💡 <i>Para análisis de valor usa:\n"
+            "/prediccion &lt;id&gt; cuota_L cuota_E cuota_V</i>"
+        )
+
+        text = "\n".join(lines)
+        if len(text) > 4000:
+            text = text[:3950] + "\n…"
+        await update.message.reply_text(text, parse_mode="HTML")
     finally:
         db.close()
 
@@ -399,6 +682,7 @@ def main() -> None:
     app.add_handler(CommandHandler("partido", cmd_partido))
     app.add_handler(CommandHandler("vivo", cmd_vivo))
     app.add_handler(CommandHandler("prediccion", cmd_prediccion))
+    app.add_handler(CommandHandler("proximos", cmd_proximos))
 
     logger.info("Bot iniciado — polling…")
     app.run_polling(allowed_updates=Update.ALL_TYPES)

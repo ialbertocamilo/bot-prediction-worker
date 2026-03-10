@@ -58,9 +58,10 @@ class MatchIngestService:
         if canonical_match.source_ref is None:
             raise ValueError("CanonicalMatch.source_ref es obligatorio para ingestión")
 
+        kind = "scraper" if "scraper" in canonical_match.source_ref.source_name else "api"
         source = self.source_repo.get_or_create(
             name=canonical_match.source_ref.source_name,
-            kind="api",
+            kind=kind,
         )
 
         if raw_payload is not None:

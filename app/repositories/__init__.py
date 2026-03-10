@@ -6,6 +6,8 @@ from app.repositories.football import (
     VenueRepository,
     MatchRepository,
     MatchEventRepository,
+    PlayerRepository,
+    MatchStatsRepository,
 )
 from app.repositories.prediction import (
     ModelRepository,
@@ -25,6 +27,8 @@ __all__ = [
     "VenueRepository",
     "MatchRepository",
     "MatchEventRepository",
+    "PlayerRepository",
+    "MatchStatsRepository",
     "ModelRepository",
     "TeamRatingRepository",
     "MatchFeatureRepository",

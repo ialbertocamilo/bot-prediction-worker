@@ -189,11 +189,18 @@ class DixonColesModel:
         else:
             p_home = p_draw = p_away = 1.0 / 3
 
-        p_under = float(sum(pm[i, j] for i in range(MAX_GOALS + 1) for j in range(MAX_GOALS + 1) if i + j <= 2))
-        p_over = 1.0 - p_under
+        # Over/Under totals for multiple thresholds
+        p_under_1_5 = float(sum(pm[i, j] for i in range(MAX_GOALS + 1) for j in range(MAX_GOALS + 1) if i + j <= 1))
+        p_under_2_5 = float(sum(pm[i, j] for i in range(MAX_GOALS + 1) for j in range(MAX_GOALS + 1) if i + j <= 2))
+        p_under_3_5 = float(sum(pm[i, j] for i in range(MAX_GOALS + 1) for j in range(MAX_GOALS + 1) if i + j <= 3))
 
         p_btts_no = float(pm[0, :].sum()) + float(pm[:, 0].sum()) - float(pm[0, 0])
         p_btts_yes = 1.0 - p_btts_no
+
+        # Double chance markets
+        p_1x = p_home + p_draw
+        p_x2 = p_draw + p_away
+        p_12 = p_home + p_away
 
         scorelines: list[tuple[int, int, float]] = []
         for i in range(min(7, MAX_GOALS + 1)):
@@ -208,10 +215,17 @@ class DixonColesModel:
             "p_away": round(p_away, 4),
             "xg_home": round(lam_h, 2),
             "xg_away": round(lam_a, 2),
-            "p_over_2_5": round(p_over, 4),
-            "p_under_2_5": round(p_under, 4),
+            "p_over_1_5": round(1.0 - p_under_1_5, 4),
+            "p_under_1_5": round(p_under_1_5, 4),
+            "p_over_2_5": round(1.0 - p_under_2_5, 4),
+            "p_under_2_5": round(p_under_2_5, 4),
+            "p_over_3_5": round(1.0 - p_under_3_5, 4),
+            "p_under_3_5": round(p_under_3_5, 4),
             "p_btts_yes": round(p_btts_yes, 4),
             "p_btts_no": round(p_btts_no, 4),
+            "p_1x": round(p_1x, 4),
+            "p_x2": round(p_x2, 4),
+            "p_12": round(p_12, 4),
             "top_scorelines": top,
             "rho": round(p.rho, 4),
             "lambda_home": round(lam_h, 4),

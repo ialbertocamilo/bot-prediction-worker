@@ -7,6 +7,8 @@ from app.domain.canonical import (
     CanonicalLeague,
     CanonicalMatch,
     CanonicalMatchEvent,
+    CanonicalMatchStats,
+    CanonicalPlayer,
     CanonicalTeam,
 )
 
@@ -54,3 +56,20 @@ class BaseProvider(ABC):
         season: int,
     ) -> CanonicalLeague | None:
         raise NotImplementedError
+
+    # ------------------------------------------------------------------
+    # Optional methods — override in providers that support these.
+    # ------------------------------------------------------------------
+
+    def get_players(
+        self,
+        league_id: int,
+        season: int,
+    ) -> list[CanonicalPlayer]:
+        return []
+
+    def get_match_stats(
+        self,
+        match_external_id: str,
+    ) -> list[CanonicalMatchStats]:
+        return []

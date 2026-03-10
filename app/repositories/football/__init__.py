@@ -4,6 +4,8 @@ from app.repositories.football.team_repository import TeamRepository
 from app.repositories.football.venue_repository import VenueRepository
 from app.repositories.football.match_repository import MatchRepository
 from app.repositories.football.match_event_repository import MatchEventRepository
+from app.repositories.football.player_repository import PlayerRepository
+from app.repositories.football.match_stats_repository import MatchStatsRepository
 
 __all__ = [
     "LeagueRepository",
@@ -12,4 +14,6 @@ __all__ = [
     "VenueRepository",
     "MatchRepository",
     "MatchEventRepository",
+    "PlayerRepository",
+    "MatchStatsRepository",
 ]
