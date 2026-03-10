@@ -83,9 +83,19 @@ class BacktestReport:
 
 
 class BacktestingService:
-    def __init__(self, db: Session, league_id: int | None = None) -> None:
+    def __init__(
+        self,
+        db: Session,
+        league_id: int | None = None,
+        time_decay: float | None = None,
+        xg_weight: float | None = None,
+        home_adv_init: float | None = None,
+    ) -> None:
         self.db = db
         self.league_id = league_id
+        self._time_decay = time_decay if time_decay is not None else TIME_DECAY
+        self._xg_weight = xg_weight if xg_weight is not None else XG_REG_WEIGHT
+        self._home_adv_init = home_adv_init if home_adv_init is not None else 0.25
 
     def run(self) -> BacktestReport:
         """Execute walk-forward backtest and return metrics."""
@@ -119,7 +129,7 @@ class BacktestingService:
                 if m.utc_date and ref_ts:
                     delta = (ref_ts - m.utc_date).total_seconds() / 86400.0
                     days_ago = max(delta, 0.0)
-                w = math.exp(-TIME_DECAY * days_ago)
+                w = math.exp(-self._time_decay * days_ago)
 
                 match_data.append(MatchData(
                     home_team_id=m.home_team_id,
@@ -158,9 +168,9 @@ class BacktestingService:
                 xg_priors[tid] = (avg_for, avg_against)
 
             # Fit and predict
-            dc = DixonColesModel(time_decay=TIME_DECAY)
+            dc = DixonColesModel(time_decay=self._time_decay, home_adv_init=self._home_adv_init)
             try:
-                params = dc.fit(match_data, xg_priors=xg_priors, xg_weight=XG_REG_WEIGHT)
+                params = dc.fit(match_data, xg_priors=xg_priors, xg_weight=self._xg_weight)
             except ValueError:
                 report.skipped_matches += 1
                 continue
