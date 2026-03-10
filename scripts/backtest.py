@@ -2,8 +2,14 @@
 Run walk-forward backtesting on the Dixon-Coles model.
 
 Usage:
-    python scripts/backtest.py                     # all leagues
-    python scripts/backtest.py --league-id 1       # specific league
+    python scripts/backtest.py --league-id 2       # recommended (xG data)
+    python scripts/backtest.py --league-id 1       # historical only
+
+Leagues:
+    --league-id 2  "Peruvian Liga 1"  → 54 partidos, xG ~43%  (recomendado)
+    --league-id 1  "Primera División"  → 306 partidos, xG <1%
+    IMPORTANTE: No mezclar ligas — equipos duplicados con IDs distintos.
+    Siempre filtrar con --league-id.
 """
 from __future__ import annotations
 

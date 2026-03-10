@@ -21,7 +21,7 @@ from sqlalchemy.orm import Session
 from app.db.models.football.match import Match
 from app.db.models.football.match_stats import MatchStats
 from app.services.prediction.dixon_coles import DixonColesModel, MatchData
-from config import TIME_DECAY, XG_REG_WEIGHT
+from config import HOME_ADVANTAGE, TIME_DECAY, XG_REG_WEIGHT
 
 logger = logging.getLogger(__name__)
 
@@ -95,7 +95,7 @@ class BacktestingService:
         self.league_id = league_id
         self._time_decay = time_decay if time_decay is not None else TIME_DECAY
         self._xg_weight = xg_weight if xg_weight is not None else XG_REG_WEIGHT
-        self._home_adv_init = home_adv_init if home_adv_init is not None else 0.25
+        self._home_adv_init = home_adv_init if home_adv_init is not None else HOME_ADVANTAGE
 
     def run(self) -> BacktestReport:
         """Execute walk-forward backtest and return metrics."""

@@ -18,13 +18,14 @@ from app.repositories.prediction.model_repository import ModelRepository
 from app.repositories.prediction.prediction_repository import PredictionRepository
 from app.repositories.prediction.team_rating_repository import TeamRatingRepository
 from app.services.prediction.dixon_coles import DixonColesModel, DixonColesParams, MatchData
-from config import TIME_DECAY, XG_REG_WEIGHT
+from config import HOME_ADVANTAGE, TIME_DECAY, XG_REG_WEIGHT
 
 logger = logging.getLogger(__name__)
 
 MODEL_NAME = "dixon_coles_v1"
 MODEL_DESCRIPTION = "Dixon-Coles (1997) con corrección ρ y decaimiento temporal"
 MIN_MATCHES = 30
+MAX_ATTACK_DEFENSE = 5.0
 
 
 class PredictionService:
@@ -98,7 +99,7 @@ class PredictionService:
         if len(match_data) < MIN_MATCHES:
             return None
 
-        dc = DixonColesModel(time_decay=TIME_DECAY)
+        dc = DixonColesModel(time_decay=TIME_DECAY, home_adv_init=HOME_ADVANTAGE)
 
         # Build xG priors: {team_id: (avg_xg_for, avg_xg_against)}
         xg_priors: dict[int, tuple[float, float]] = {}
@@ -128,10 +129,14 @@ class PredictionService:
         for tid in (match.home_team_id, match.away_team_id):
             att = params.attack.get(tid, 0.0)
             dfn = params.defense.get(tid, 0.0)
+            att = max(-MAX_ATTACK_DEFENSE, min(MAX_ATTACK_DEFENSE, att))
+            dfn = max(-MAX_ATTACK_DEFENSE, min(MAX_ATTACK_DEFENSE, dfn))
             self.rating_repo.create(
                 model_id=model_rec.id,
                 team_id=tid,
                 rating=att - dfn,
+                attack=att,
+                defense=dfn,
                 as_of_date=as_of,
                 as_of_match_id=match_id,
             )

@@ -19,6 +19,8 @@ import numpy as np
 from scipy.optimize import minimize
 from scipy.stats import poisson as poisson_dist
 
+from config import HOME_ADVANTAGE
+
 logger = logging.getLogger(__name__)
 
 MAX_GOALS = 10
@@ -106,9 +108,9 @@ def _neg_log_likelihood(
     return -np.sum(ll) + penalty + penalty_xg
 
 class DixonColesModel:
-    def __init__(self, time_decay: float = 0.005, home_adv_init: float = 0.25) -> None:
+    def __init__(self, time_decay: float = 0.005, home_adv_init: float | None = None) -> None:
         self.time_decay = time_decay
-        self.home_adv_init = home_adv_init
+        self.home_adv_init = home_adv_init if home_adv_init is not None else HOME_ADVANTAGE
         self.params: DixonColesParams | None = None
 
     def fit(
@@ -166,7 +168,7 @@ class DixonColesModel:
         x0[2 * n + 1] = -0.05 
 
         bounds = [(None, None)] * (2 * n)
-        bounds.append((None, None)) 
+        bounds.append((0.0, 1.5))  # home advantage: non-negative, capped
         bounds.append((-0.99, 0.99))  
 
         res = minimize(

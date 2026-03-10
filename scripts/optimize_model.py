@@ -2,10 +2,15 @@
 Grid-search hyperparameter optimization for Dixon-Coles model.
 
 Usage:
-    python scripts/optimize_model.py --mode coarse                 # fast 27 combos
-    python scripts/optimize_model.py --mode fine                   # coarse → fine
-    python scripts/optimize_model.py --mode full                   # all 294 combos
-    python scripts/optimize_model.py --mode fine --league-id 325   # specific league
+    python scripts/optimize_model.py --mode coarse --league-id 2   # fast 27 combos
+    python scripts/optimize_model.py --mode fine --league-id 2     # coarse → fine (recomendado)
+    python scripts/optimize_model.py --mode full --league-id 1     # all 294 combos
+
+Leagues:
+    --league-id 2  "Peruvian Liga 1"  → 54 partidos, xG ~43%  (recomendado)
+    --league-id 1  "Primera División"  → 306 partidos, xG <1%
+    IMPORTANTE: No mezclar ligas — equipos duplicados con IDs distintos.
+    Siempre filtrar con --league-id.
 """
 from __future__ import annotations
 

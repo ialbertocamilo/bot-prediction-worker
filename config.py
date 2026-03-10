@@ -12,3 +12,7 @@ TIME_DECAY = float(os.getenv("TIME_DECAY", "0.005"))
 # Higher values pull parameters more toward xG-implied strengths.
 # 0.0 = no xG influence, 3.0 = moderate regularization.
 XG_REG_WEIGHT = float(os.getenv("XG_REG_WEIGHT", "3.0"))
+
+# Dixon-Coles home-advantage initial value.
+# The optimizer starts from this value; bounded to [0.0, 1.5] during fitting.
+HOME_ADVANTAGE = float(os.getenv("HOME_ADVANTAGE", "0.25"))

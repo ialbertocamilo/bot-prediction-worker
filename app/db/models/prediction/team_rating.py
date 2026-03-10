@@ -15,6 +15,8 @@ class TeamRating(Base):
     team_id: Mapped[int] = mapped_column(ForeignKey("teams.id", ondelete="CASCADE"), nullable=False)
 
     rating: Mapped[float] = mapped_column(Float, nullable=False)
+    attack: Mapped[float | None] = mapped_column(Float, nullable=True)
+    defense: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     as_of_date: Mapped[object] = mapped_column(DateTime(timezone=True), nullable=False)
     as_of_match_id: Mapped[int | None] = mapped_column(ForeignKey("matches.id", ondelete="SET NULL"), nullable=True)
