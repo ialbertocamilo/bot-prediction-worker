@@ -236,18 +236,4 @@ class DixonColesModel:
             "defense_away": round(d_a, 4),
         }
 
-    @staticmethod
-    def time_weights(
-        matches: list[MatchData],
-        reference_date: float | None = None,
-        decay: float = 0.005,
-    ) -> list[MatchData]:
-        """
-        Return a new list of MatchData with weights set by exponential decay.
-        ``reference_date`` is a UNIX timestamp; defaults to max weight-date in
-        the list (i.e. the most recent match gets weight=1).
-        """
-        if not matches:
-            return []
-    
-        return matches  
+

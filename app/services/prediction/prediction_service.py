@@ -17,12 +17,12 @@ from app.repositories.prediction.model_repository import ModelRepository
 from app.repositories.prediction.prediction_repository import PredictionRepository
 from app.repositories.prediction.team_rating_repository import TeamRatingRepository
 from app.services.prediction.dixon_coles import DixonColesModel, DixonColesParams, MatchData
+from config import TIME_DECAY
 
 logger = logging.getLogger(__name__)
 
 MODEL_NAME = "dixon_coles_v1"
 MODEL_DESCRIPTION = "Dixon-Coles (1997) con corrección ρ y decaimiento temporal"
-TIME_DECAY = 0.005
 MIN_MATCHES = 30
 
 
