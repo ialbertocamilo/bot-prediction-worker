@@ -1,5 +1,13 @@
 """
-Test endpoints — read-only HTTP interface for prediction pipeline.
+API endpoints — read-only HTTP interface mirroring bot commands + pipeline tools.
+
+GET  /leagues              — List canonical (deduplicated) leagues
+GET  /matches?league=N     — Upcoming scheduled matches (optional canonical league filter)
+GET  /predict?match_number=N — Prediction for match N from /matches listing
+
+POST /backtest             — Walk-forward backtesting
+POST /rolling_retrain      — Rolling retraining
+POST /optimize_model       — Hyperparameter grid search
 
 These endpoints do NOT modify production services or their logic.
 They call existing services as-is and return results as JSON.
@@ -10,17 +18,14 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.db.session import SessionLocal
-from app.repositories.football.match_repository import MatchRepository
+from app.services.canonical_league_service import CanonicalLeagueService
 from app.services.prediction.backtesting_service import BacktestingService
 from app.services.prediction.hyperparameter_optimization_service import (
-    COARSE_HOME_ADV_GRID,
-    COARSE_TIME_DECAY_GRID,
-    COARSE_XG_WEIGHT_GRID,
     HyperparameterOptimizationService,
 )
 from app.services.prediction.prediction_service import PredictionService
@@ -39,11 +44,7 @@ def _get_db():
         db.close()
 
 
-# ── Request / Response schemas ────────────────────────────────────────────
-
-class PredictRequest(BaseModel):
-    match_number: int = Field(..., ge=1, description="Number from /matches listing")
-
+# ── Request schemas (for POST endpoints) ─────────────────────────────────
 
 class BacktestRequest(BaseModel):
     league_id: int = Field(..., description="League ID to backtest")
@@ -67,18 +68,57 @@ _upcoming_cache: list[dict] = []
 _upcoming_match_ids: list[int] = []
 
 
+# ── GET /leagues ──────────────────────────────────────────────────────────
+
+@router.get("/leagues")
+def list_leagues(db: Session = Depends(_get_db)):
+    """Return canonical (deduplicated) leagues with match counts."""
+    svc = CanonicalLeagueService(db)
+    leagues = svc.list_leagues()
+
+    items = []
+    for lg in leagues:
+        if lg.scheduled_matches == 0:
+            logger.warning(
+                "Auditoria: liga '%s' (index=%d) sin partidos programados",
+                lg.display_name, lg.index,
+            )
+        items.append({
+            "index": lg.index,
+            "key": lg.key,
+            "name": lg.display_name,
+            "country": lg.country,
+            "db_league_ids": lg.db_league_ids,
+            "finished_matches": lg.finished_matches,
+            "scheduled_matches": lg.scheduled_matches,
+        })
+
+    return {"count": len(items), "leagues": items}
+
+
 # ── GET /matches ──────────────────────────────────────────────────────────
 
 @router.get("/matches")
-def list_matches(db: Session = Depends(_get_db)):
-    """Return upcoming scheduled matches with user-friendly numbers."""
+def list_matches(
+    league: int | None = Query(None, description="Canonical league index (from /leagues)"),
+    db: Session = Depends(_get_db),
+):
+    """Return upcoming scheduled matches (deduplicated across providers)."""
     global _upcoming_cache, _upcoming_match_ids
 
-    now = datetime.now(timezone.utc)
-    date_to = now + timedelta(days=14)
+    svc = CanonicalLeagueService(db)
 
-    matches = MatchRepository(db).list_by_date_range(date_from=now, date_to=date_to)
-    upcoming = [m for m in matches if m.status in ("SCHEDULED", "NS")]
+    # Auto-ingest if the selected canonical league has no matches
+    if league is not None:
+        all_leagues = svc.list_leagues()
+        if league < 1 or league > len(all_leagues):
+            raise HTTPException(
+                status_code=400,
+                detail=f"league out of range. Valid: 1-{len(all_leagues)}",
+            )
+        svc.auto_ingest_if_empty(league)
+
+    upcoming = svc.get_upcoming(canonical_index=league)
 
     items = []
     match_ids = []
@@ -88,7 +128,8 @@ def list_matches(db: Session = Depends(_get_db)):
             "match_id": m.id,
             "home_team": m.home_team.name if m.home_team else None,
             "away_team": m.away_team.name if m.away_team else None,
-            "league": m.league.name if m.league else None,
+            "league": svc.display_name_for(m.league_id),
+            "league_id": m.league_id,
             "utc_date": m.utc_date.isoformat() if m.utc_date else None,
             "round": m.round,
         })
@@ -97,26 +138,29 @@ def list_matches(db: Session = Depends(_get_db)):
     _upcoming_cache = items
     _upcoming_match_ids = match_ids
 
-    return {"count": len(items), "matches": items}
+    return {"count": len(items), "league": league, "matches": items}
 
 
-# ── POST /predict ─────────────────────────────────────────────────────────
+# ── GET /predict ──────────────────────────────────────────────────────────
 
-@router.post("/predict")
-def predict_match(req: PredictRequest, db: Session = Depends(_get_db)):
+@router.get("/predict")
+def predict_match(
+    match_number: int = Query(..., ge=1, description="Number from /matches listing"),
+    db: Session = Depends(_get_db),
+):
     """Predict a match by its number from the /matches listing."""
     if not _upcoming_match_ids:
         raise HTTPException(
             status_code=400,
             detail="No match listing available. Call GET /matches first.",
         )
-    if req.match_number < 1 or req.match_number > len(_upcoming_match_ids):
+    if match_number > len(_upcoming_match_ids):
         raise HTTPException(
             status_code=400,
             detail=f"match_number out of range. Valid: 1-{len(_upcoming_match_ids)}",
         )
 
-    match_id = _upcoming_match_ids[req.match_number - 1]
+    match_id = _upcoming_match_ids[match_number - 1]
     service = PredictionService(db)
     result = service.predict_match(match_id)
     if result is None:
@@ -129,7 +173,7 @@ def predict_match(req: PredictRequest, db: Session = Depends(_get_db)):
     if result.get("utc_date"):
         result["utc_date"] = result["utc_date"].isoformat()
 
-    return {"match_number": req.match_number, "match_id": match_id, "prediction": result}
+    return {"match_number": match_number, "match_id": match_id, "prediction": result}
 
 
 # ── POST /backtest ────────────────────────────────────────────────────────

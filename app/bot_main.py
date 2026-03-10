@@ -1,26 +1,25 @@
 """
 Bot de Telegram — lee datos de la DB, predice con Dixon-Coles.
 
-Comandos simplificados para usuario final:
-    /start           — Bienvenida y ayuda
-    /matches         — Lista proximos partidos con numero de opcion
-    /predict <num>   — Prediccion completa del partido seleccionado
+Comandos:
+    /start              — Bienvenida y ayuda
+    /leagues            — Listar ligas disponibles (canónicas, deduplicadas)
+    /matches [liga]     — Próximos partidos (opcionalmente filtrar por liga canónica)
+    /predict <número>   — Predicción completa del partido seleccionado
 """
 from __future__ import annotations
 
 import logging
 import os
-from datetime import datetime, timedelta, timezone
 
 from dotenv import load_dotenv
-from sqlalchemy import select
 from sqlalchemy.orm import Session
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 from app.db.models.football.match import Match
 from app.db.session import SessionLocal
-from app.repositories.football.match_repository import MatchRepository
+from app.services.canonical_league_service import CanonicalLeagueService
 from app.services.prediction.prediction_service import PredictionService
 
 load_dotenv()
@@ -64,40 +63,103 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Hola {_escape_html(user.first_name or 'Usuario')}!\n\n"
         "Soy tu bot de predicciones de futbol con modelo Dixon-Coles.\n\n"
         "<b>Comandos:</b>\n"
-        "/matches  — Ver proximos partidos\n"
-        "/predict &lt;numero&gt;  — Prediccion del partido\n\n"
-        "<i>Ejemplo: primero usa /matches, luego /predict 1</i>"
+        "/leagues  — Ligas disponibles\n"
+        "/matches  — Próximos partidos (todas las ligas)\n"
+        "/matches &lt;num&gt;  — Partidos de una liga\n"
+        "/predict &lt;num&gt;  — Predicción del partido\n\n"
+        "<i>Ejemplo: /leagues → /matches 1 → /predict 1</i>"
     )
     await update.message.reply_text(msg, parse_mode="HTML")
+
+
+# ── /leagues ──────────────────────────────────────────────────────────────
+
+async def cmd_leagues(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List canonical (deduplicated) leagues."""
+    db = _db()
+    try:
+        svc = CanonicalLeagueService(db)
+        leagues = svc.list_leagues()
+
+        if not leagues:
+            await update.message.reply_text("No hay ligas registradas en la DB.")
+            return
+
+        lines = ["<b>Ligas disponibles</b>\n"]
+        for lg in leagues:
+            country = f" ({_escape_html(lg.country)})" if lg.country else ""
+            if lg.scheduled_matches == 0:
+                logger.warning(
+                    "Auditoria: liga '%s' (index=%d) sin partidos programados",
+                    lg.display_name, lg.index,
+                )
+            lines.append(
+                f"  <b>{lg.index}</b> — {_escape_html(lg.display_name)}{country}\n"
+                f"      {lg.finished_matches} jugados | {lg.scheduled_matches} programados"
+            )
+
+        lines.append(
+            "\n<i>Usa /matches &lt;num&gt; para ver partidos.\n"
+            "Ejemplo: /matches 1</i>"
+        )
+
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    finally:
+        db.close()
 
 
 # ── /matches ──────────────────────────────────────────────────────────────
 
 async def cmd_matches(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """List upcoming scheduled matches with a user-friendly number."""
-    db = _db()
-    try:
-        now = datetime.now(timezone.utc)
-        date_to = now + timedelta(days=14)
-
-        matches = MatchRepository(db).list_by_date_range(
-            date_from=now, date_to=date_to,
-        )
-        upcoming = [m for m in matches if m.status in ("SCHEDULED", "NS")]
-
-        if not upcoming:
-            await update.message.reply_text("No hay partidos programados.")
+    """List upcoming scheduled matches, optionally filtered by canonical league index."""
+    canonical_index: int | None = None
+    if context.args:
+        try:
+            canonical_index = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text(
+                "Liga inválida. Usa /leagues para ver los números disponibles."
+            )
             return
 
-        # Store in cache so /predict can use the number
+    db = _db()
+    try:
+        svc = CanonicalLeagueService(db)
+
+        # Auto-ingest if the selected canonical league has no matches
+        if canonical_index is not None:
+            leagues = svc.list_leagues()
+            if canonical_index < 1 or canonical_index > len(leagues):
+                await update.message.reply_text(
+                    f"Liga fuera de rango. Usa /leagues para ver los números."
+                )
+                return
+            ingested = svc.auto_ingest_if_empty(canonical_index)
+            if ingested:
+                logger.info("Auto-ingest: %d partidos nuevos", ingested)
+
+        upcoming = svc.get_upcoming(canonical_index)
+
+        if not upcoming:
+            filter_msg = f" para liga {canonical_index}" if canonical_index else ""
+            await update.message.reply_text(
+                f"No hay partidos programados{filter_msg}."
+            )
+            return
+
         chat_id = update.effective_chat.id
         _matches_cache[chat_id] = upcoming
 
-        lines = ["<b>Proximos partidos</b>\n"]
+        filter_label = ""
+        if canonical_index is not None:
+            info = svc.list_leagues()[canonical_index - 1]
+            filter_label = f" ({info.display_name})"
+
+        lines = [f"<b>Próximos partidos{_escape_html(filter_label)}</b>\n"]
         current_league = ""
 
         for idx, m in enumerate(upcoming[:30], 1):
-            league_name = m.league.name if m.league else "?"
+            league_name = svc.display_name_for(m.league_id)
             if league_name != current_league:
                 current_league = league_name
                 lines.append(f"\n<b>{_escape_html(league_name)}</b>")
@@ -113,7 +175,7 @@ async def cmd_matches(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
 
         lines.append(
-            "\n<i>Usa /predict &lt;numero&gt; para ver la prediccion.\n"
+            "\n<i>Usa /predict &lt;num&gt; para ver la predicción.\n"
             "Ejemplo: /predict 1</i>"
         )
 
@@ -131,7 +193,7 @@ async def cmd_predict(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     """Predict the match selected by number from /matches."""
     if not context.args:
         await update.message.reply_text(
-            "Uso: /predict &lt;numero&gt;\n\n"
+            "Uso: /predict &lt;num&gt;\n\n"
             "Primero usa /matches para ver la lista.",
             parse_mode="HTML",
         )
@@ -263,6 +325,7 @@ def main() -> None:
 
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("leagues", cmd_leagues))
     app.add_handler(CommandHandler("matches", cmd_matches))
     app.add_handler(CommandHandler("predict", cmd_predict))
 
