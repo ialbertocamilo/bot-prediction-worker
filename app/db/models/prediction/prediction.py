@@ -19,8 +19,12 @@ class Prediction(Base):
     p_draw: Mapped[float] = mapped_column(Float, nullable=False)
     p_away: Mapped[float] = mapped_column(Float, nullable=False)
 
+    p_over_1_5: Mapped[float | None] = mapped_column(Float, nullable=True)
+    p_under_1_5: Mapped[float | None] = mapped_column(Float, nullable=True)
     p_over_2_5: Mapped[float | None] = mapped_column(Float, nullable=True)
     p_under_2_5: Mapped[float | None] = mapped_column(Float, nullable=True)
+    p_over_3_5: Mapped[float | None] = mapped_column(Float, nullable=True)
+    p_under_3_5: Mapped[float | None] = mapped_column(Float, nullable=True)
     p_btts_yes: Mapped[float | None] = mapped_column(Float, nullable=True)
     p_btts_no: Mapped[float | None] = mapped_column(Float, nullable=True)
 

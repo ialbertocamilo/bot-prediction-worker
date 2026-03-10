@@ -7,7 +7,6 @@ import logging
 import math
 from datetime import datetime, timezone
 
-from scipy.stats import poisson as poisson_dist
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -119,8 +118,12 @@ class PredictionService:
             p_home=result["p_home"],
             p_draw=result["p_draw"],
             p_away=result["p_away"],
+            p_over_1_5=result["p_over_1_5"],
+            p_under_1_5=result["p_under_1_5"],
             p_over_2_5=result["p_over_2_5"],
             p_under_2_5=result["p_under_2_5"],
+            p_over_3_5=result["p_over_3_5"],
+            p_under_3_5=result["p_under_3_5"],
             p_btts_yes=result["p_btts_yes"],
             p_btts_no=result["p_btts_no"],
             xg_home=result["xg_home"],
@@ -158,8 +161,12 @@ class PredictionService:
             "p_home": pred.p_home,
             "p_draw": pred.p_draw,
             "p_away": pred.p_away,
+            "p_over_1_5": pred.p_over_1_5,
+            "p_under_1_5": pred.p_under_1_5,
             "p_over_2_5": pred.p_over_2_5,
             "p_under_2_5": pred.p_under_2_5,
+            "p_over_3_5": pred.p_over_3_5,
+            "p_under_3_5": pred.p_under_3_5,
             "p_btts_yes": pred.p_btts_yes,
             "p_btts_no": pred.p_btts_no,
             "xg_home": pred.xg_home,
@@ -172,19 +179,4 @@ class PredictionService:
             "p_x2": round(pred.p_draw + pred.p_away, 4),
             "p_12": round(pred.p_home + pred.p_away, 4),
         }
-        # Compute O/U 1.5 and 3.5 from stored xG using Poisson approximation
-        if pred.xg_home is not None and pred.xg_away is not None:
-            lh, la = pred.xg_home, pred.xg_away
-            p_u15 = sum(
-                float(poisson_dist.pmf(i, lh) * poisson_dist.pmf(j, la))
-                for i in range(11) for j in range(11) if i + j <= 1
-            )
-            p_u35 = sum(
-                float(poisson_dist.pmf(i, lh) * poisson_dist.pmf(j, la))
-                for i in range(11) for j in range(11) if i + j <= 3
-            )
-            d["p_over_1_5"] = round(1.0 - p_u15, 4)
-            d["p_under_1_5"] = round(p_u15, 4)
-            d["p_over_3_5"] = round(1.0 - p_u35, 4)
-            d["p_under_3_5"] = round(p_u35, 4)
         return d
