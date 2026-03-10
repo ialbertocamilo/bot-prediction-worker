@@ -29,7 +29,7 @@ class MatchData:
     away_team_id: int
     home_goals: int
     away_goals: int
-    weight: float = 1.0 
+    weight: float = 1.0
 
 
 @dataclass
@@ -62,6 +62,10 @@ def _neg_log_likelihood(
     ag: np.ndarray,
     weights: np.ndarray,
     n_teams: int,
+    xg_att_prior: np.ndarray,
+    xg_def_prior: np.ndarray,
+    xg_mask: np.ndarray,
+    xg_weight: float,
 ) -> float:
     attack = params[:n_teams]
     defense = params[n_teams: 2 * n_teams]
@@ -91,14 +95,27 @@ def _neg_log_likelihood(
 
     penalty = 100.0 * np.sum(attack) ** 2
 
-    return -np.sum(ll) + penalty
+    # xG-based regularization: pull attack/defense toward xG-implied priors
+    penalty_xg = 0.0
+    if xg_weight > 0.0:
+        penalty_xg = xg_weight * np.sum(
+            xg_mask * ((attack - xg_att_prior) ** 2
+                       + (defense - xg_def_prior) ** 2)
+        )
+
+    return -np.sum(ll) + penalty + penalty_xg
 
 class DixonColesModel:
     def __init__(self, time_decay: float = 0.005) -> None:
         self.time_decay = time_decay
         self.params: DixonColesParams | None = None
 
-    def fit(self, matches: list[MatchData]) -> DixonColesParams:
+    def fit(
+        self,
+        matches: list[MatchData],
+        xg_priors: dict[int, tuple[float, float]] | None = None,
+        xg_weight: float = 0.0,
+    ) -> DixonColesParams:
         if len(matches) < 10:
             raise ValueError("Se necesitan al menos 10 partidos para ajustar Dixon-Coles")
 
@@ -112,6 +129,37 @@ class DixonColesModel:
         ag = np.array([m.away_goals for m in matches], dtype=np.float64)
         w = np.array([m.weight for m in matches], dtype=np.float64)
 
+        # Build xG prior arrays (centered log-scale)
+        xg_att_prior = np.zeros(n)
+        xg_def_prior = np.zeros(n)
+        xg_mask = np.zeros(n)
+        eff_xg_weight = 0.0
+
+        if xg_priors and xg_weight > 0:
+            log_atts: list[float] = []
+            log_defs: list[float] = []
+            for i, t in enumerate(teams):
+                if t in xg_priors:
+                    xg_for, xg_against = xg_priors[t]
+                    xg_att_prior[i] = math.log(max(xg_for, 0.1))
+                    xg_def_prior[i] = math.log(max(xg_against, 0.1))
+                    xg_mask[i] = 1.0
+                    log_atts.append(xg_att_prior[i])
+                    log_defs.append(xg_def_prior[i])
+            # Center priors (compatible with sum-to-zero constraint)
+            if log_atts:
+                mean_att = sum(log_atts) / len(log_atts)
+                mean_def = sum(log_defs) / len(log_defs)
+                for i in range(n):
+                    if xg_mask[i]:
+                        xg_att_prior[i] -= mean_att
+                        xg_def_prior[i] -= mean_def
+                eff_xg_weight = xg_weight
+                logger.info(
+                    "xG priors: %d/%d equipos con datos xG, peso=%.1f",
+                    int(np.sum(xg_mask)), n, eff_xg_weight,
+                )
+
         x0 = np.zeros(2 * n + 2)
         x0[2 * n] = 0.25      
         x0[2 * n + 1] = -0.05 
@@ -123,7 +171,8 @@ class DixonColesModel:
         res = minimize(
             _neg_log_likelihood,
             x0,
-            args=(hi, ai, hg, ag, w, n),
+            args=(hi, ai, hg, ag, w, n,
+                  xg_att_prior, xg_def_prior, xg_mask, eff_xg_weight),
             method="L-BFGS-B",
             bounds=bounds,
             options={"maxiter": 500, "ftol": 1e-8},

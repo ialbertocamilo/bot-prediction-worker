@@ -11,13 +11,14 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db.models.football.match import Match
+from app.db.models.football.match_stats import MatchStats
 from app.repositories.football.match_repository import MatchRepository
 from app.repositories.prediction.match_feature_repository import MatchFeatureRepository
 from app.repositories.prediction.model_repository import ModelRepository
 from app.repositories.prediction.prediction_repository import PredictionRepository
 from app.repositories.prediction.team_rating_repository import TeamRatingRepository
 from app.services.prediction.dixon_coles import DixonColesModel, DixonColesParams, MatchData
-from config import TIME_DECAY
+from config import TIME_DECAY, XG_REG_WEIGHT
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +63,11 @@ class PredictionService:
             return None
 
         now_ts = datetime.now(timezone.utc)
+        xg_map = self._load_xg_map([m.id for m in training])
         match_data: list[MatchData] = []
+        # Collect per-team xG aggregates for regularization priors
+        xg_for_lists: dict[int, list[float]] = {}
+        xg_against_lists: dict[int, list[float]] = {}
         for m in training:
             if m.home_goals is None or m.away_goals is None:
                 continue
@@ -71,6 +76,7 @@ class PredictionService:
                 delta = (now_ts - m.utc_date).total_seconds() / 86400.0
                 days_ago = max(delta, 0.0)
             w = math.exp(-TIME_DECAY * days_ago)
+
             match_data.append(MatchData(
                 home_team_id=m.home_team_id,
                 away_team_id=m.away_team_id,
@@ -79,11 +85,29 @@ class PredictionService:
                 weight=w,
             ))
 
+            # Accumulate xG per team (for = own offensive, against = opponent)
+            pair = xg_map.get(m.id, {})
+            h_xg = pair.get(m.home_team_id)
+            a_xg = pair.get(m.away_team_id)
+            if h_xg is not None and a_xg is not None:
+                xg_for_lists.setdefault(m.home_team_id, []).append(h_xg)
+                xg_against_lists.setdefault(m.home_team_id, []).append(a_xg)
+                xg_for_lists.setdefault(m.away_team_id, []).append(a_xg)
+                xg_against_lists.setdefault(m.away_team_id, []).append(h_xg)
+
         if len(match_data) < MIN_MATCHES:
             return None
 
         dc = DixonColesModel(time_decay=TIME_DECAY)
-        params = dc.fit(match_data)
+
+        # Build xG priors: {team_id: (avg_xg_for, avg_xg_against)}
+        xg_priors: dict[int, tuple[float, float]] = {}
+        for tid in set(xg_for_lists) & set(xg_against_lists):
+            avg_for = sum(xg_for_lists[tid]) / len(xg_for_lists[tid])
+            avg_against = sum(xg_against_lists[tid]) / len(xg_against_lists[tid])
+            xg_priors[tid] = (avg_for, avg_against)
+
+        params = dc.fit(match_data, xg_priors=xg_priors, xg_weight=XG_REG_WEIGHT)
         result = dc.predict_match(match.home_team_id, match.away_team_id, params)
 
         self.feature_repo.upsert(
@@ -129,11 +153,28 @@ class PredictionService:
             xg_home=result["xg_home"],
             xg_away=result["xg_away"],
             top_scorelines=result["top_scorelines"],
-            data_quality=f"{len(match_data)}_matches",
+            data_quality=f"{len(match_data)}_matches_{len(xg_priors)}_xg_teams",
         )
 
         self.db.commit()
         return self._to_dict(prediction, match)
+
+    def _load_xg_map(self, match_ids: list[int]) -> dict[int, dict[int, float]]:
+        """Load xG values from match_stats for given match IDs.
+
+        Returns ``{match_id: {team_id: xg}}``.
+        """
+        if not match_ids:
+            return {}
+        stmt = (
+            select(MatchStats.match_id, MatchStats.team_id, MatchStats.xg)
+            .where(MatchStats.match_id.in_(match_ids))
+            .where(MatchStats.xg.isnot(None))
+        )
+        result: dict[int, dict[int, float]] = {}
+        for row in self.db.execute(stmt):
+            result.setdefault(row.match_id, {})[row.team_id] = row.xg
+        return result
 
     def _training_matches(self, league_id: int, exclude_id: int) -> list[Match]:
         stmt = (
