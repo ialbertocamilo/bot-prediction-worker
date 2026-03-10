@@ -92,12 +92,33 @@ class EspnScraperClient:
 
         # Filtrar solo las fechas del calendario que caen en nuestro rango
         target_dates: list[date] = []
-        for cal_date_str in calendar_dates:
+        for cal_entry in calendar_dates:
             try:
-                cal_date = date.fromisoformat(cal_date_str[:10])
+                # ESPN returns either plain date strings ("2026-03-10")
+                # or dicts with entries/dates for tournament-style leagues.
+                if isinstance(cal_entry, str):
+                    raw = cal_entry[:10]
+                elif isinstance(cal_entry, dict):
+                    # Tournament calendar: {"entries": [{"startDate": "..."}]}
+                    raw = cal_entry.get("startDate", cal_entry.get("date", ""))[:10]
+                    if not raw:
+                        # Nested entries
+                        for e in cal_entry.get("entries", []):
+                            sd = e.get("startDate", "")[:10]
+                            if sd:
+                                try:
+                                    cd = date.fromisoformat(sd)
+                                    if date_from <= cd <= date_to and cd not in target_dates:
+                                        target_dates.append(cd)
+                                except (ValueError, IndexError):
+                                    pass
+                        continue
+                else:
+                    continue
+                cal_date = date.fromisoformat(raw)
                 if date_from <= cal_date <= date_to:
                     target_dates.append(cal_date)
-            except (ValueError, IndexError):
+            except (ValueError, IndexError, TypeError):
                 continue
 
         # Si no hay calendario, iterar día a día (fallback)

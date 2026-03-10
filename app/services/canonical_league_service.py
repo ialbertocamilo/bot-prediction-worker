@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 
 from sqlalchemy import func, select
@@ -28,6 +28,9 @@ logger = logging.getLogger(__name__)
 # ── Configuración de grupos canónicos ─────────────────────────────────────
 # Cada grupo une varios league_ids de la DB que apuntan a la MISMA liga.
 # provider_*: se usa para auto-ingest cuando no hay partidos programados.
+# league_names: nombres que ESPN (u otro provider) puede dar a esta liga
+#               en la DB.  Se usan para auto-descubrir db_league_ids.
+# espn_slug:    slug de ESPN para crear el provider con la liga correcta.
 
 
 @dataclass
@@ -36,6 +39,8 @@ class _LeagueGroup:
     display_name: str
     country: str | None
     db_league_ids: list[int]
+    league_names: list[str] = field(default_factory=list)
+    espn_slug: str | None = None
     provider_name: str | None = None
     provider_league_id: int | None = None
     provider_season: int | None = None
@@ -47,9 +52,83 @@ LEAGUE_GROUPS: list[_LeagueGroup] = [
         display_name="Liga 1 Peru",
         country="Peru",
         db_league_ids=[1, 2],
+        league_names=["Primera División", "Peruvian Liga 1", "Liga 1"],
+        espn_slug="per.1",
         provider_name="espn-scraper",
         provider_league_id=670,
         provider_season=2026,
+    ),
+    _LeagueGroup(
+        key="champions-league",
+        display_name="Champions League",
+        country=None,
+        db_league_ids=[],
+        league_names=["UEFA Champions League", "Champions League"],
+        espn_slug="uefa.champions",
+        provider_name="espn-scraper",
+    ),
+    _LeagueGroup(
+        key="premier-league",
+        display_name="Premier League",
+        country="England",
+        db_league_ids=[],
+        league_names=["English Premier League", "Premier League"],
+        espn_slug="eng.1",
+        provider_name="espn-scraper",
+    ),
+    _LeagueGroup(
+        key="la-liga",
+        display_name="La Liga",
+        country="Spain",
+        db_league_ids=[],
+        league_names=["Spanish LaLiga", "La Liga", "LaLiga"],
+        espn_slug="esp.1",
+        provider_name="espn-scraper",
+    ),
+    _LeagueGroup(
+        key="bundesliga",
+        display_name="Bundesliga",
+        country="Germany",
+        db_league_ids=[],
+        league_names=["German Bundesliga", "Bundesliga"],
+        espn_slug="ger.1",
+        provider_name="espn-scraper",
+    ),
+    _LeagueGroup(
+        key="serie-a",
+        display_name="Serie A",
+        country="Italy",
+        db_league_ids=[],
+        league_names=["Italian Serie A", "Serie A"],
+        espn_slug="ita.1",
+        provider_name="espn-scraper",
+    ),
+    _LeagueGroup(
+        key="ligue-1",
+        display_name="Ligue 1",
+        country="France",
+        db_league_ids=[],
+        league_names=["French Ligue 1", "Ligue 1"],
+        espn_slug="fra.1",
+        provider_name="espn-scraper",
+    ),
+    _LeagueGroup(
+        key="mls",
+        display_name="MLS",
+        country="USA",
+        db_league_ids=[],
+        league_names=["Major League Soccer", "MLS"],
+        espn_slug="usa.1",
+        provider_name="espn-scraper",
+    ),
+    _LeagueGroup(
+        key="europa-league",
+        display_name="Europa League",
+        country=None,
+        db_league_ids=[],
+        league_names=["UEFA Europa League", "Europa League"],
+        espn_slug="uefa.europa",
+        provider_name="espn-scraper",
     ),
 ]
 
@@ -76,34 +155,59 @@ class CanonicalLeagueService:
     def __init__(self, db: Session) -> None:
         self.db = db
         self._groups = {g.key: g for g in LEAGUE_GROUPS}
+        # Build resolved ID mappings: group key → resolved DB IDs
+        self._resolved: dict[str, list[int]] = {}
         self._id_to_key: dict[int, str] = {}
         for g in LEAGUE_GROUPS:
-            for lid in g.db_league_ids:
+            ids = self._resolve_league_ids(g)
+            self._resolved[g.key] = ids
+            for lid in ids:
                 self._id_to_key[lid] = g.key
+
+    # ── resolver IDs de DB dinámicamente ─────────────────────────────────
+
+    def _resolve_league_ids(self, group: _LeagueGroup) -> list[int]:
+        """Combine static db_league_ids + auto-discovery by league_names."""
+        ids: set[int] = set(group.db_league_ids)
+        if group.league_names:
+            all_leagues = list(self.db.scalars(select(League)))
+            for lg in all_leagues:
+                if self._name_matches(lg.name, group.league_names):
+                    ids.add(lg.id)
+        return sorted(ids)
+
+    @staticmethod
+    def _name_matches(db_name: str, patterns: list[str]) -> bool:
+        """Case-insensitive match: exact OR either is substring of the other."""
+        db_lower = db_name.lower().strip()
+        for p in patterns:
+            p_lower = p.lower().strip()
+            if db_lower == p_lower or p_lower in db_lower or db_lower in p_lower:
+                return True
+        return False
 
     # ── listar ligas deduplicadas ─────────────────────────────────────────
 
     def list_leagues(self) -> list[CanonicalLeagueInfo]:
-        all_db = list(self.db.scalars(select(League).order_by(League.name)).all())
-
         result: list[CanonicalLeagueInfo] = []
-        seen_keys: set[str] = set()
+        grouped_ids: set[int] = set()
 
+        # 1. All configured groups (even if no DB data yet)
+        for g in LEAGUE_GROUPS:
+            ids = self._resolved.get(g.key, [])
+            grouped_ids.update(ids)
+            fin, sch = self._count(ids) if ids else (0, 0)
+            result.append(CanonicalLeagueInfo(
+                index=0, key=g.key,
+                display_name=g.display_name, country=g.country,
+                db_league_ids=ids,
+                finished_matches=fin, scheduled_matches=sch,
+            ))
+
+        # 2. Standalone DB leagues not in any group
+        all_db = list(self.db.scalars(select(League).order_by(League.name)).all())
         for lg in all_db:
-            key = self._id_to_key.get(lg.id)
-            if key:
-                if key in seen_keys:
-                    continue
-                seen_keys.add(key)
-                g = self._groups[key]
-                fin, sch = self._count(g.db_league_ids)
-                result.append(CanonicalLeagueInfo(
-                    index=0, key=key,
-                    display_name=g.display_name, country=g.country,
-                    db_league_ids=g.db_league_ids,
-                    finished_matches=fin, scheduled_matches=sch,
-                ))
-            else:
+            if lg.id not in grouped_ids:
                 fin, sch = self._count([lg.id])
                 result.append(CanonicalLeagueInfo(
                     index=0, key=f"league-{lg.id}",
@@ -165,31 +269,65 @@ class CanonicalLeagueService:
         Retorna cantidad de partidos ingestados (0 si no fue necesario).
         """
         league_ids = self._ids_for_index(canonical_index)
-        if not league_ids:
-            return 0
 
         leagues = self.list_leagues()
+        if canonical_index < 1 or canonical_index > len(leagues):
+            return 0
         info = leagues[canonical_index - 1]
         cfg = self._groups.get(info.key)
         if not cfg or not cfg.provider_name:
             return 0
 
-        if self.get_upcoming(canonical_index):
+        if league_ids and self.get_upcoming(canonical_index):
             return 0
 
+        return self._ingest_from_provider(cfg)
+
+    def ingest_league(self, key: str, days_back: int = 180, days_ahead: int = 30) -> int:
+        """Ingest results + fixtures for a league group by key.
+
+        Returns number of matches ingested.
+        """
+        cfg = self._groups.get(key)
+        if not cfg or not cfg.provider_name:
+            logger.warning("ingest_league: no provider configured for %s", key)
+            return 0
+        return self._ingest_from_provider(cfg, days_back=days_back, days_ahead=days_ahead)
+
+    def seed_all_leagues(self, days_back: int = 180, days_ahead: int = 30) -> int:
+        """Ingest all configured leagues. Returns total matches ingested."""
+        total = 0
+        for i, g in enumerate(LEAGUE_GROUPS, 1):
+            if not g.provider_name:
+                continue
+            logger.info(
+                "=== [%d/%d] Seeding %s ===", i, len(LEAGUE_GROUPS), g.display_name,
+            )
+            n = self._ingest_from_provider(g, days_back=days_back, days_ahead=days_ahead)
+            total += n
+            logger.info("%s: %d partidos ingestados", g.display_name, n)
+        # Rebuild resolved IDs after all ingests
+        self._rebuild_mappings()
+        return total
+
+    def _ingest_from_provider(
+        self,
+        cfg: _LeagueGroup,
+        days_back: int = 60,
+        days_ahead: int = 14,
+    ) -> int:
+        """Core ingest logic shared by auto_ingest and seed."""
         logger.info(
-            "Auto-ingest: '%s' sin partidos, sincronizando desde %s",
-            cfg.display_name, cfg.provider_name,
+            "Ingest: '%s' desde %s (slug=%s)",
+            cfg.display_name, cfg.provider_name, cfg.espn_slug,
         )
 
-        from app.providers.factory import ProviderFactory
-        from app.services.ingest.match_ingest_service import MatchIngestService
+        provider = self._create_provider(cfg)
 
-        provider = ProviderFactory.create(cfg.provider_name)
-        d_from = date.today() - timedelta(days=60)
-        d_to = date.today() + timedelta(days=14)
+        d_from = date.today() - timedelta(days=days_back)
+        d_to = date.today() + timedelta(days=days_ahead)
         season = cfg.provider_season or int(os.getenv("DEFAULT_SEASON", "2026"))
-        ext_id = cfg.provider_league_id or int(os.getenv("DEFAULT_LEAGUE_ID", "670"))
+        ext_id = cfg.provider_league_id or 0
 
         results = provider.get_results(
             league_id=ext_id, season=season, date_from=d_from, date_to=d_to,
@@ -200,13 +338,46 @@ class CanonicalLeagueService:
         all_m = results + fixtures
 
         if not all_m:
+            logger.info("Ingest: 0 partidos obtenidos para '%s'", cfg.display_name)
             return 0
+
+        from app.services.ingest.match_ingest_service import MatchIngestService
 
         svc = MatchIngestService(self.db)
         ids = svc.ingest_matches(all_m)
         self.db.commit()
-        logger.info("Auto-ingest: %d partidos para '%s'", len(ids), cfg.display_name)
+
+        # Rebuild resolved IDs so new leagues are visible immediately
+        self._rebuild_mappings()
+
+        logger.info(
+            "Ingest: %d partidos para '%s' (provider=%s)",
+            len(ids), cfg.display_name, cfg.provider_name,
+        )
         return len(ids)
+
+    def _create_provider(self, cfg: _LeagueGroup):
+        """Create provider instance with correct league configuration."""
+        if cfg.espn_slug and cfg.provider_name == "espn-scraper":
+            from app.providers.espn_scraper.client import EspnScraperClient
+            from app.providers.espn_scraper.provider import EspnScraperProvider
+
+            return EspnScraperProvider(
+                client=EspnScraperClient(league_slug=cfg.espn_slug),
+            )
+        from app.providers.factory import ProviderFactory
+
+        return ProviderFactory.create(cfg.provider_name)
+
+    def _rebuild_mappings(self) -> None:
+        """Re-resolve DB IDs after ingest creates new league entries."""
+        self._resolved.clear()
+        self._id_to_key.clear()
+        for g in LEAGUE_GROUPS:
+            ids = self._resolve_league_ids(g)
+            self._resolved[g.key] = ids
+            for lid in ids:
+                self._id_to_key[lid] = g.key
 
     # ── helpers privados ──────────────────────────────────────────────────
 

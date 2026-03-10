@@ -284,3 +284,40 @@ def run_optimize(req: OptimizeRequest, db: Session = Depends(_get_db)):
             for i, r in enumerate(ranked, 1)
         ],
     }
+
+
+# ── POST /seed_leagues ───────────────────────────────────────────────────
+
+class SeedRequest(BaseModel):
+    league_key: str | None = Field(None, description="Single league key, or null for all")
+    days_back: int = Field(180, description="Days of historical data to ingest")
+    days_ahead: int = Field(30, description="Days of upcoming fixtures to ingest")
+
+
+@router.post("/seed_leagues")
+def seed_leagues(req: SeedRequest, db: Session = Depends(_get_db)):
+    """Ingest results + fixtures for configured leagues from ESPN."""
+    svc = CanonicalLeagueService(db)
+
+    if req.league_key:
+        n = svc.ingest_league(req.league_key, days_back=req.days_back, days_ahead=req.days_ahead)
+        ingested = {req.league_key: n}
+    else:
+        total = svc.seed_all_leagues(days_back=req.days_back, days_ahead=req.days_ahead)
+        ingested = {"_total": total}
+
+    # Fresh summary
+    svc2 = CanonicalLeagueService(db)
+    summary = [
+        {
+            "index": lg.index,
+            "key": lg.key,
+            "name": lg.display_name,
+            "finished": lg.finished_matches,
+            "scheduled": lg.scheduled_matches,
+            "db_league_ids": lg.db_league_ids,
+        }
+        for lg in svc2.list_leagues()
+    ]
+
+    return {"ingested": ingested, "leagues": summary}
