@@ -130,6 +130,15 @@ LEAGUE_GROUPS: list[_LeagueGroup] = [
         espn_slug="uefa.europa",
         provider_name="espn-scraper",
     ),
+    _LeagueGroup(
+        key="copa-libertadores",
+        display_name="Copa Libertadores",
+        country=None,
+        db_league_ids=[],
+        league_names=["Copa Libertadores", "CONMEBOL Libertadores", "Libertadores"],
+        espn_slug="conmebol.libertadores",
+        provider_name="espn-scraper",
+    ),
 ]
 
 
