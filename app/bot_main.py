@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 
 from dotenv import load_dotenv
 from sqlalchemy.orm import Session
@@ -33,8 +34,32 @@ logger = logging.getLogger(__name__)
 TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
 
 # In-memory cache of the latest /matches listing per chat.
-# Maps chat_id → list of Match objects in displayed order.
-_matches_cache: dict[int, list[Match]] = {}
+# Each entry stores (timestamp, matches) so stale entries can be evicted.
+_CACHE_TTL_SECS = 900  # 15 minutes
+_CACHE_MAX_ENTRIES = 200
+
+_matches_cache: dict[int, tuple[float, list[Match]]] = {}
+
+
+def _cache_get(chat_id: int) -> list[Match] | None:
+    """Return cached matches if still valid, else None."""
+    entry = _matches_cache.get(chat_id)
+    if entry is None:
+        return None
+    ts, matches = entry
+    if time.monotonic() - ts > _CACHE_TTL_SECS:
+        _matches_cache.pop(chat_id, None)
+        return None
+    return matches
+
+
+def _cache_set(chat_id: int, matches: list[Match]) -> None:
+    """Store matches in cache with TTL and evict if over limit."""
+    # Evict oldest entries if cache is too large
+    if len(_matches_cache) >= _CACHE_MAX_ENTRIES:
+        oldest_key = min(_matches_cache, key=lambda k: _matches_cache[k][0])
+        _matches_cache.pop(oldest_key, None)
+    _matches_cache[chat_id] = (time.monotonic(), matches)
 
 
 def _db() -> Session:
@@ -148,7 +173,7 @@ async def cmd_matches(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
 
         chat_id = update.effective_chat.id
-        _matches_cache[chat_id] = upcoming
+        _cache_set(chat_id, upcoming)
 
         filter_label = ""
         if canonical_index is not None:
@@ -206,7 +231,7 @@ async def cmd_predict(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     chat_id = update.effective_chat.id
-    cached = _matches_cache.get(chat_id)
+    cached = _cache_get(chat_id)
     if not cached:
         await update.message.reply_text(
             "No hay listado activo. Usa /matches primero."

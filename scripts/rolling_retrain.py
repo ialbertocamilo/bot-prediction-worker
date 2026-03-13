@@ -52,7 +52,12 @@ def main() -> None:
             dry_run=args.dry_run,
         )
         report = svc.run()
+        if not args.dry_run:
+            db.commit()
         print(report.summary())
+    except Exception:
+        db.rollback()
+        raise
     finally:
         db.close()
 

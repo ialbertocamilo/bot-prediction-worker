@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import logging
 import os
-import time
 from datetime import date
 from typing import Any
 
 import requests
+
+from app.providers.cache import ProviderCache, get_provider_cache
+from app.providers.rate_limiter import RateLimiter, get_rate_limiter
 
 logger = logging.getLogger(__name__)
 
@@ -36,9 +38,8 @@ class SofaScoreClient:
         self.season_id: int | None = season_id or (
             int(os.getenv("SOFASCORE_SEASON_ID")) if os.getenv("SOFASCORE_SEASON_ID") else None
         )
-        self._last_request_time: float = 0.0
-        self._session: requests.Session = requests.Session()
-        self._session.headers.update(
+        session = requests.Session()
+        session.headers.update(
             {
                 "User-Agent": (
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -52,24 +53,24 @@ class SofaScoreClient:
                 "Cache-Control": "no-cache",
             }
         )
-
-    # ── Throttle ────────────────────────────────────────────────
-
-    def _throttle(self) -> None:
-        elapsed = time.monotonic() - self._last_request_time
-        if elapsed < self._MIN_INTERVAL:
-            wait = self._MIN_INTERVAL - elapsed
-            logger.debug("SofaScore: esperando %.1fs por rate-limit", wait)
-            time.sleep(wait)
+        self._limiter: RateLimiter = get_rate_limiter(
+            "sofascore", min_interval=self._MIN_INTERVAL, session=session,
+        )
+        self._cache: ProviderCache = get_provider_cache()
 
     def _get(self, path: str) -> dict[str, Any]:
         url = f"{self.BASE_URL}/{path}"
-        self._throttle()
+        cache_key = self._cache.make_key("sofascore", path)
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            logger.debug("SofaScore cache hit: %s", path)
+            return cached
+
         logger.debug("SofaScore GET %s", url)
-        resp = self._session.get(url, timeout=20)
-        self._last_request_time = time.monotonic()
-        resp.raise_for_status()
-        return resp.json()
+        resp = self._limiter.get(url, timeout=20)
+        data = resp.json()
+        self._cache.set(cache_key, data)
+        return data
 
     # ── Estadísticas de un partido ──────────────────────────────
 

@@ -8,12 +8,21 @@ from app.domain.canonical import (
     CanonicalMatch,
     CanonicalMatchEvent,
     CanonicalMatchStats,
+    CanonicalOdds,
     CanonicalPlayer,
     CanonicalTeam,
 )
 
 
 class BaseProvider(ABC):
+    """Abstract base for all data providers (APIs and scrapers)."""
+
+    @property
+    def provider_name(self) -> str:
+        """Unique identifier for this provider (e.g. 'espn-scraper')."""
+        # Default: derive from class name. Override for custom names.
+        return self.__class__.__name__
+
     @abstractmethod
     def get_fixtures(
         self,
@@ -72,4 +81,30 @@ class BaseProvider(ABC):
         self,
         match_external_id: str,
     ) -> list[CanonicalMatchStats]:
+        return []
+
+    def get_finished_events_page(
+        self,
+        page: int = 0,
+    ) -> list[dict]:
+        """Return a page of finished events for iterating stats coverage.
+
+        Each dict should have at minimum:
+            {"id": str, "home_team": str, "away_team": str}
+
+        Providers that don't support event listing return [].
+        """
+        return []
+
+    def get_odds(
+        self,
+        league_id: int,
+        season: int,
+        date_from: date,
+        date_to: date,
+    ) -> list[CanonicalOdds]:
+        """Return 1X2 market odds for matches in the date range.
+
+        Providers that don't support odds return [].
+        """
         return []

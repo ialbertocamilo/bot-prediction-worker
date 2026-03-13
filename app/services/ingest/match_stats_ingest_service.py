@@ -70,8 +70,8 @@ class MatchStatsIngestService:
         if match_id is None:
             return None  # skip — match not yet ingested
 
-        # Resolve team
-        team = self.team_repo.find_by_name_country(name=canonical.team_name)
+        # Resolve team (exact first, then fuzzy, then create)
+        team = self.team_repo.find_by_name_fuzzy(name=canonical.team_name)
         if team is None:
             team = self.team_repo.create(name=canonical.team_name)
         team_id = team.id

@@ -83,6 +83,26 @@ class SofaScoreProvider(BaseProvider):
         )
         return result
 
+    def get_finished_events_page(self, page: int = 0) -> list[dict]:
+        """Return a page of finished events from SofaScore tournament."""
+        try:
+            data = self.client.get_tournament_events(page=page, direction="last")
+        except Exception:
+            logger.exception("SofaScore: error fetching events page %d", page)
+            return []
+
+        events = data.get("events", [])
+        result = []
+        for event in events:
+            if event.get("status", {}).get("type", "") != "finished":
+                continue
+            result.append({
+                "id": str(event["id"]),
+                "home_team": event.get("homeTeam", {}).get("name", ""),
+                "away_team": event.get("awayTeam", {}).get("name", ""),
+            })
+        return result
+
     # ── Métodos de partidos — no soportados como foco ───────────
 
     def get_fixtures(

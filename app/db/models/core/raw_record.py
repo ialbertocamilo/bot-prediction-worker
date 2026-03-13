@@ -52,4 +52,8 @@ class RawRecord(Base):
             "entity_type",
             "fetched_at"
         ),
+        Index(
+            "ix_raw_records_fetched_at",
+            "fetched_at",
+        ),
     )

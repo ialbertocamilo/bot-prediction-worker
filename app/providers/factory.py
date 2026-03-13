@@ -1,12 +1,20 @@
 from __future__ import annotations
 
+from typing import Any
+
 from app.providers.base import BaseProvider
 
 
 class ProviderFactory:
     @staticmethod
-    def create(provider_name: str) -> BaseProvider:
+    def create(provider_name: str, **kwargs: Any) -> BaseProvider:
+        """Create a provider instance by name.
+
+        Keyword arguments are forwarded to the provider constructor
+        when applicable (e.g., league_slug for ESPN).
+        """
         normalized_name: str = provider_name.strip().lower()
+        league_slug = kwargs.get("league_slug")
 
         if normalized_name == "api-football":
             from app.providers.api_football.provider import ApiFootballProvider
@@ -17,8 +25,10 @@ class ProviderFactory:
             return FootballDataOrgProvider()
 
         if normalized_name == "espn-scraper":
+            from app.providers.espn_scraper.client import EspnScraperClient
             from app.providers.espn_scraper.provider import EspnScraperProvider
-            return EspnScraperProvider()
+            client = EspnScraperClient(league_slug=league_slug) if league_slug else EspnScraperClient()
+            return EspnScraperProvider(client=client)
 
         if normalized_name == "composite":
             from app.providers.composite import CompositeProvider

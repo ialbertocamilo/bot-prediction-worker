@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from app.db.models.core.raw_record import RawRecord
@@ -44,3 +44,11 @@ class RawRecordRepository:
             .order_by(RawRecord.fetched_at.desc())
         )
         return list(self.db.scalars(stmt).all())
+
+    def purge_older_than(self, days: int = 90) -> int:
+        """Delete raw records older than *days*. Returns rows deleted."""
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        stmt = delete(RawRecord).where(RawRecord.fetched_at < cutoff)
+        result = self.db.execute(stmt)
+        self.db.flush()
+        return result.rowcount

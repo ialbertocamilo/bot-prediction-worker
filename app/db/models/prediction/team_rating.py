@@ -1,4 +1,4 @@
-from sqlalchemy import Float, DateTime, ForeignKey, func, Index
+from sqlalchemy import Float, DateTime, ForeignKey, func, Index, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -23,11 +23,12 @@ class TeamRating(Base):
 
     created_at: Mapped[object] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
-    model = relationship("Model", lazy="joined")
-    team = relationship("Team", lazy="joined")
-    season = relationship("Season", lazy="joined")
-    as_of_match = relationship("Match", lazy="joined")
+    model = relationship("Model", lazy="select")
+    team = relationship("Team", lazy="select")
+    season = relationship("Season", lazy="select")
+    as_of_match = relationship("Match", lazy="select")
 
     __table_args__ = (
+        UniqueConstraint("model_id", "team_id", "as_of_match_id", name="uq_team_ratings_model_team_match"),
         Index("ix_team_ratings_model_team_date", "model_id", "team_id", "as_of_date"),
     )

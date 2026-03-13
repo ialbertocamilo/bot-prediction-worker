@@ -36,6 +36,7 @@ class MatchIngestService:
         raw_payloads: list[dict[str, Any]] | None = None,
     ) -> list[int]:
         created_or_updated_match_ids: list[int] = []
+        leagues_with_new_results: set[int] = set()
 
         for index, canonical_match in enumerate(matches):
             raw_payload: dict[str, Any] | None = None
@@ -47,6 +48,26 @@ class MatchIngestService:
                 raw_payload=raw_payload,
             )
             created_or_updated_match_ids.append(match_id)
+
+            # Track leagues that received finished results
+            if (canonical_match.status.value == "FINISHED"
+                    and canonical_match.home_goals is not None):
+                match_obj = self.match_repo.get_by_id(match_id)
+                if match_obj:
+                    leagues_with_new_results.add(match_obj.league_id)
+
+        # Invalidate cached future predictions for affected leagues
+        if leagues_with_new_results:
+            from app.services.prediction.prediction_service import PredictionService
+            pred_svc = PredictionService(self.db)
+            for league_id in leagues_with_new_results:
+                invalidated = pred_svc.invalidate_league_predictions(league_id)
+                if invalidated:
+                    import logging
+                    logging.getLogger(__name__).info(
+                        "Invalidated %d cached predictions for league %d",
+                        invalidated, league_id,
+                    )
 
         return created_or_updated_match_ids
 
@@ -217,7 +238,7 @@ class MatchIngestService:
             if existing_mapping is not None:
                 return existing_mapping.canonical_id
 
-        existing_team = self.team_repo.find_by_name_country(
+        existing_team = self.team_repo.find_by_name_fuzzy(
             name=team_name,
             country=None,
         )

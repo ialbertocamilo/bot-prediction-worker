@@ -23,7 +23,7 @@ from config import HOME_ADVANTAGE
 
 logger = logging.getLogger(__name__)
 
-MAX_GOALS = 10
+MAX_GOALS = 12
 
 @dataclass(frozen=True)
 class MatchData:
@@ -74,10 +74,10 @@ def _neg_log_likelihood(
     home_adv = params[2 * n_teams]
     rho = params[2 * n_teams + 1]
 
-    lam1 = np.exp(attack[home_idx] + defense[away_idx] + home_adv)
-    lam2 = np.exp(attack[away_idx] + defense[home_idx])
+    lam1 = np.exp(np.clip(attack[home_idx] + defense[away_idx] + home_adv, -20, 5))
+    lam2 = np.exp(np.clip(attack[away_idx] + defense[home_idx], -20, 5))
 
-    ll = hg * np.log(lam1) - lam1 + ag * np.log(lam2) - lam2
+    ll = hg * np.log(np.maximum(lam1, 1e-10)) - lam1 + ag * np.log(np.maximum(lam2, 1e-10)) - lam2
 
     tau_vals = np.ones(len(hg))
     m00 = (hg == 0) & (ag == 0)
@@ -95,7 +95,8 @@ def _neg_log_likelihood(
 
     ll *= weights
 
-    penalty = 100.0 * np.sum(attack) ** 2
+    # Sum-to-zero constraints for identifiability (attack AND defense)
+    penalty = 100.0 * (np.sum(attack) ** 2 + np.sum(defense) ** 2)
 
     # xG-based regularization: pull attack/defense toward xG-implied priors
     penalty_xg = 0.0
@@ -192,6 +193,18 @@ class DixonColesModel:
             teams=teams,
             converged=bool(res.success),
         )
+
+        # Drift detection: log extreme parameter values
+        att_vals = list(self.params.attack.values())
+        def_vals = list(self.params.defense.values())
+        max_att = max(abs(v) for v in att_vals) if att_vals else 0.0
+        max_def = max(abs(v) for v in def_vals) if def_vals else 0.0
+        if max_att > 3.0 or max_def > 3.0:
+            logger.warning(
+                "Drift warning: extreme params — max|attack|=%.3f, max|defense|=%.3f, HA=%.3f, rho=%.3f",
+                max_att, max_def, self.params.home_advantage, self.params.rho,
+            )
+
         return self.params
 
 
@@ -213,18 +226,20 @@ class DixonColesModel:
         a_a = p.attack.get(away_team_id, avg_att)
         d_a = p.defense.get(away_team_id, avg_def)
 
-        lam_h = math.exp(a_h + d_a + p.home_advantage)
-        lam_a = math.exp(a_a + d_h)
+        lam_h = math.exp(max(min(a_h + d_a + p.home_advantage, 5), -20))
+        lam_a = math.exp(max(min(a_a + d_h, 5), -20))
 
-        pm = np.zeros((MAX_GOALS + 1, MAX_GOALS + 1))
-        for i in range(MAX_GOALS + 1):
-            for j in range(MAX_GOALS + 1):
-                pm[i, j] = max(
-                    poisson_dist.pmf(i, lam_h)
-                    * poisson_dist.pmf(j, lam_a)
-                    * _tau(i, j, lam_h, lam_a, p.rho),
-                    0.0,
-                )
+        goals = np.arange(MAX_GOALS + 1)
+        pmf_h = poisson_dist.pmf(goals, lam_h)
+        pmf_a = poisson_dist.pmf(goals, lam_a)
+        pm = np.outer(pmf_h, pmf_a)
+
+        # Apply Dixon-Coles τ correction to low-scoring cells
+        pm[0, 0] *= (1.0 - lam_h * lam_a * p.rho)
+        pm[0, 1] *= (1.0 + lam_h * p.rho)
+        pm[1, 0] *= (1.0 + lam_a * p.rho)
+        pm[1, 1] *= (1.0 - p.rho)
+        np.maximum(pm, 0.0, out=pm)
 
         total = pm.sum()
         if total > 0:
@@ -241,10 +256,11 @@ class DixonColesModel:
         else:
             p_home = p_draw = p_away = 1.0 / 3
 
-        # Over/Under totals for multiple thresholds
-        p_under_1_5 = float(sum(pm[i, j] for i in range(MAX_GOALS + 1) for j in range(MAX_GOALS + 1) if i + j <= 1))
-        p_under_2_5 = float(sum(pm[i, j] for i in range(MAX_GOALS + 1) for j in range(MAX_GOALS + 1) if i + j <= 2))
-        p_under_3_5 = float(sum(pm[i, j] for i in range(MAX_GOALS + 1) for j in range(MAX_GOALS + 1) if i + j <= 3))
+        # Over/Under totals for multiple thresholds (vectorised)
+        goals_grid = np.add.outer(np.arange(MAX_GOALS + 1), np.arange(MAX_GOALS + 1))
+        p_under_1_5 = float(pm[goals_grid <= 1].sum())
+        p_under_2_5 = float(pm[goals_grid <= 2].sum())
+        p_under_3_5 = float(pm[goals_grid <= 3].sum())
 
         p_btts_no = float(pm[0, :].sum()) + float(pm[:, 0].sum()) - float(pm[0, 0])
         p_btts_yes = 1.0 - p_btts_no

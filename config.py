@@ -16,3 +16,9 @@ XG_REG_WEIGHT = float(os.getenv("XG_REG_WEIGHT", "3.0"))
 # Dixon-Coles home-advantage initial value.
 # The optimizer starts from this value; bounded to [0.0, 1.5] during fitting.
 HOME_ADVANTAGE = float(os.getenv("HOME_ADVANTAGE", "0.25"))
+
+# Platt calibration toggle.  Set to "false" to disable post-hoc calibration.
+CALIBRATION_ENABLED = os.getenv("CALIBRATION_ENABLED", "true").lower() in ("true", "1", "yes")
+
+# Minimum evaluated predictions required before Platt calibration kicks in.
+CALIBRATION_MIN_SAMPLES = int(os.getenv("CALIBRATION_MIN_SAMPLES", "50"))

@@ -1,4 +1,4 @@
-from sqlalchemy import Float, String, DateTime, ForeignKey, func, Index
+from sqlalchemy import Float, String, DateTime, ForeignKey, func, Index, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -36,9 +36,10 @@ class Prediction(Base):
     data_quality: Mapped[str | None] = mapped_column(String(40), nullable=True)  
     features_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
-    match = relationship("Match", lazy="joined")
-    model = relationship("Model", lazy="joined")
+    match = relationship("Match", lazy="select")
+    model = relationship("Model", lazy="select")
 
     __table_args__ = (
+        UniqueConstraint("match_id", "model_id", name="uq_predictions_match_model"),
         Index("ix_predictions_match_model_time", "match_id", "model_id", "created_at"),
     )

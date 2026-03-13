@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import logging
 import os
-import time
 from datetime import date, timedelta
 from typing import Any
 
 import requests
+
+from app.providers.cache import ProviderCache, get_provider_cache
+from app.providers.rate_limiter import RateLimiter, get_rate_limiter
 
 logger = logging.getLogger(__name__)
 
@@ -38,29 +40,30 @@ class EspnScraperClient:
 
     def __init__(self, league_slug: str | None = None) -> None:
         self.league_slug: str = league_slug or os.getenv("ESPN_LEAGUE_SLUG", "per.1")
-        self._last_request_time: float = 0.0
-
-    def _throttle(self) -> None:
-        elapsed = time.monotonic() - self._last_request_time
-        if elapsed < self._MIN_INTERVAL:
-            wait = self._MIN_INTERVAL - elapsed
-            logger.debug("ESPN scraper: esperando %.1fs por rate-limit", wait)
-            time.sleep(wait)
+        self._limiter: RateLimiter = get_rate_limiter(
+            "espn-scraper", min_interval=self._MIN_INTERVAL,
+        )
+        self._cache: ProviderCache = get_provider_cache()
 
     def _get(self, url: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        self._throttle()
-        response: requests.Response = requests.get(
+        cache_key = self._cache.make_key("espn-scraper", url, params)
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            logger.debug("ESPN cache hit: %s", url)
+            return cached
+
+        resp = self._limiter.get(
             url,
-            params=params or {},
+            params=params,
             headers={
                 "User-Agent": "Mozilla/5.0 (compatible; SoccerBot/1.0)",
                 "Accept": "application/json",
             },
             timeout=20,
         )
-        self._last_request_time = time.monotonic()
-        response.raise_for_status()
-        return response.json()
+        data = resp.json()
+        self._cache.set(cache_key, data)
+        return data
 
     # ── Scoreboard (partidos de una fecha) ──────────────────────
 

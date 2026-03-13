@@ -227,6 +227,12 @@ def run_rolling_retrain(req: RollingRetrainRequest, db: Session = Depends(_get_d
     )
     report = svc.run()
 
+    # Invalidate cached predictions after actual retrain
+    invalidated = 0
+    if not req.dry_run:
+        pred_svc = PredictionService(db)
+        invalidated = pred_svc.invalidate_stale_predictions()
+
     return {
         "league_id": req.league_id,
         "dry_run": req.dry_run,
@@ -236,6 +242,7 @@ def run_rolling_retrain(req: RollingRetrainRequest, db: Session = Depends(_get_d
         "skipped_existing": report.skipped_existing,
         "teams_updated": report.teams_updated,
         "params_clipped": report.params_clipped,
+        "predictions_invalidated": invalidated,
     }
 
 
@@ -255,6 +262,10 @@ def run_optimize(req: OptimizeRequest, db: Session = Depends(_get_db)):
 
     best = report.best
     ranked = report.ranked[:10]
+
+    # Invalidate cached predictions after optimization
+    pred_svc = PredictionService(db)
+    invalidated = pred_svc.invalidate_stale_predictions()
 
     return {
         "league_id": req.league_id,
@@ -283,6 +294,7 @@ def run_optimize(req: OptimizeRequest, db: Session = Depends(_get_db)):
             }
             for i, r in enumerate(ranked, 1)
         ],
+        "predictions_invalidated": invalidated,
     }
 
 

@@ -15,10 +15,11 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, noload
 
 from app.db.models.football.match import Match
 from app.db.models.football.match_stats import MatchStats
+from app.repositories.prediction.league_hyperparams_repository import LeagueHyperparamsRepository
 from app.repositories.prediction.model_repository import ModelRepository
 from app.repositories.prediction.team_rating_repository import TeamRatingRepository
 from app.services.prediction.dixon_coles import DixonColesModel, MatchData
@@ -78,9 +79,22 @@ class RollingRetrainService:
         self.dry_run = dry_run
         self.model_repo = ModelRepository(db)
         self.rating_repo = TeamRatingRepository(db)
+        self.hp_repo = LeagueHyperparamsRepository(db)
+
+    def _league_params(self) -> tuple[float, float, float]:
+        """Return (time_decay, xg_reg_weight, home_advantage) for the league."""
+        if self.league_id is not None:
+            hp = self.hp_repo.get_by_league(self.league_id)
+            td = hp.time_decay if hp and hp.time_decay is not None else TIME_DECAY
+            xg_w = hp.xg_reg_weight if hp and hp.xg_reg_weight is not None else XG_REG_WEIGHT
+            ha = hp.home_advantage if hp and hp.home_advantage is not None else HOME_ADVANTAGE
+            return td, xg_w, ha
+        return TIME_DECAY, XG_REG_WEIGHT, HOME_ADVANTAGE
 
     def run(self) -> RollingRetrainReport:
         report = RollingRetrainReport(dry_run=self.dry_run)
+
+        time_decay, xg_reg_weight, home_advantage = self._league_params()
 
         model_rec = self.model_repo.get_or_create(
             name=MODEL_NAME,
@@ -127,7 +141,7 @@ class RollingRetrainService:
                 if m.utc_date and ref_ts:
                     delta = (ref_ts - m.utc_date).total_seconds() / 86400.0
                     days_ago = max(delta, 0.0)
-                w = math.exp(-TIME_DECAY * days_ago)
+                w = math.exp(-time_decay * days_ago)
 
                 match_data.append(MatchData(
                     home_team_id=m.home_team_id,
@@ -158,9 +172,9 @@ class RollingRetrainService:
                 xg_priors[tid] = (avg_for, avg_against)
 
             # Fit Dixon-Coles
-            dc = DixonColesModel(time_decay=TIME_DECAY, home_adv_init=HOME_ADVANTAGE)
+            dc = DixonColesModel(time_decay=time_decay, home_adv_init=home_advantage)
             try:
-                params = dc.fit(match_data, xg_priors=xg_priors, xg_weight=XG_REG_WEIGHT)
+                params = dc.fit(match_data, xg_priors=xg_priors, xg_weight=xg_reg_weight)
             except ValueError:
                 report.skipped_insufficient += 1
                 continue
@@ -198,7 +212,7 @@ class RollingRetrainService:
             report.teams_updated += teams_in_snapshot
 
             if not self.dry_run and report.processed % 25 == 0:
-                self.db.commit()
+                self.db.flush()
 
             if report.processed % 50 == 0:
                 logger.info(
@@ -206,9 +220,9 @@ class RollingRetrainService:
                     report.processed, report.total_matches, report.teams_updated,
                 )
 
-        # Final commit
+        # Final flush — caller is responsible for commit.
         if not self.dry_run:
-            self.db.commit()
+            self.db.flush()
 
         return report
 
@@ -221,6 +235,7 @@ class RollingRetrainService:
             .where(Match.home_goals.isnot(None))
             .where(Match.away_goals.isnot(None))
             .order_by(Match.utc_date.asc())
+            .options(noload("*"))
         )
         if self.league_id is not None:
             stmt = stmt.where(Match.league_id == self.league_id)

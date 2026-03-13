@@ -1,5 +1,5 @@
 from sqlalchemy import (
-    String, Integer, DateTime, ForeignKey, func, Index, CheckConstraint
+    String, Integer, DateTime, ForeignKey, func, Index, CheckConstraint, UniqueConstraint
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -61,6 +61,7 @@ class Match(Base):
 
     __table_args__ = (
         CheckConstraint("home_team_id <> away_team_id", name="ck_matches_home_away_diff"),
+        UniqueConstraint("league_id", "utc_date", "home_team_id", "away_team_id", name="uq_matches_signature"),
 
         Index("ix_matches_league_date", "league_id", "utc_date"),
         Index("ix_matches_season_date", "season_id", "utc_date"),

@@ -85,10 +85,14 @@ class MatchRepository:
         if venue_id is not None:
             match.venue_id = venue_id
 
-        match.home_goals = home_goals
-        match.away_goals = away_goals
-        match.ht_home_goals = ht_home_goals
-        match.ht_away_goals = ht_away_goals
+        if home_goals is not None:
+            match.home_goals = home_goals
+        if away_goals is not None:
+            match.away_goals = away_goals
+        if ht_home_goals is not None:
+            match.ht_home_goals = ht_home_goals
+        if ht_away_goals is not None:
+            match.ht_away_goals = ht_away_goals
 
         if round_value is not None:
             match.round = round_value
