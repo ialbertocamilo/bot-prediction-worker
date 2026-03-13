@@ -66,4 +66,6 @@ class Match(Base):
         Index("ix_matches_league_date", "league_id", "utc_date"),
         Index("ix_matches_season_date", "season_id", "utc_date"),
         Index("ix_matches_pair_date", "home_team_id", "away_team_id", "utc_date"),
+        Index("ix_matches_league_status_date", "league_id", "status", "utc_date"),
+        Index("ix_matches_status_date", "status", "utc_date"),
     )

@@ -183,54 +183,61 @@ def start_scheduler() -> None:
 
     _scheduler = BackgroundScheduler(timezone="UTC")
 
-    # Job 1: sync pipeline (delay 30s to let the server start cleanly)
-    _initial_delay = int(os.getenv("SCHEDULER_INITIAL_DELAY_SECS", "30"))
+    # Flag para controlar si queremos que los jobs arranquen casi de inmediato
+    run_on_startup = os.getenv("SCHEDULER_RUN_ON_STARTUP", "true").lower() in ("true", "1")
+    now = datetime.now(timezone.utc)
+
+    if run_on_startup:
+        _delay = int(os.getenv("SCHEDULER_INITIAL_DELAY_SECS", "30"))
+        # Si queremos que arranquen, los escalonamos para que no choquen
+        first_sync = now + timedelta(seconds=_delay)
+        first_retrain = now + timedelta(seconds=_delay + 60) # 1 min después del sync
+        first_backfill = now + timedelta(seconds=_delay + 120) # 2 min después
+    else:
+        # Si NO queremos que arranquen en el boot, calculamos su ciclo natural
+        first_sync = now + timedelta(hours=SYNC_INTERVAL_HOURS)
+        first_retrain = now + timedelta(hours=RETRAIN_INTERVAL_HOURS)
+        first_backfill = now + timedelta(hours=BACKFILL_INTERVAL_HOURS)
+
     _scheduler.add_job(
         _run_sync_pipeline,
         "interval",
         hours=SYNC_INTERVAL_HOURS,
         id="sync_pipeline",
         name="Sync fixtures + stats + predicciones",
-        next_run_time=datetime.now(timezone.utc) + timedelta(seconds=_initial_delay),
+        next_run_time=first_sync, # APLICADO AQUÍ
         misfire_grace_time=3600,
         coalesce=True,
         max_instances=1,
     )
 
-    # Job 2: retrain pipeline
     _scheduler.add_job(
         _run_retrain_pipeline,
         "interval",
         hours=RETRAIN_INTERVAL_HOURS,
         id="retrain_pipeline",
         name="Rolling retrain + backtest",
+        next_run_time=first_retrain, # APLICADO AQUÍ
         misfire_grace_time=3600,
         coalesce=True,
         max_instances=1,
     )
 
-    # Job 3: backfill stats
     _scheduler.add_job(
         _run_backfill_pipeline,
         "interval",
         hours=BACKFILL_INTERVAL_HOURS,
         id="backfill_pipeline",
         name="Backfill historical stats",
+        next_run_time=first_backfill, # APLICADO AQUÍ
         misfire_grace_time=3600,
         coalesce=True,
         max_instances=1,
     )
 
     _scheduler.start()
-
-    logger.info(
-        "🚀 Scheduler iniciado — sync cada %.1fh, retrain cada %.1fh, backfill cada %.1fh",
-        SYNC_INTERVAL_HOURS,
-        RETRAIN_INTERVAL_HOURS,
-        BACKFILL_INTERVAL_HOURS,
-    )
-    for job in _scheduler.get_jobs():
-        logger.info("  Job '%s' próxima ejecución: %s", job.name, job.next_run_time)
+    
+    logger.info("🚀 Scheduler iniciado correctamente.")
 
 
 def stop_scheduler() -> None:

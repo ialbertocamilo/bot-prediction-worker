@@ -192,3 +192,38 @@ class MultiClassPlattCalibrator:
             round(c_draw / total, 6),
             round(c_away / total, 6),
         )
+
+
+class BinaryPlattCalibrator:
+    """Platt calibrator for a single binary market (Over/Under, BTTS Yes/No).
+
+    Wraps a PlattCalibrator to calibrate complementary-pair probabilities
+    so they still sum to 1.0 after calibration.
+    """
+
+    def __init__(self) -> None:
+        self._cal = PlattCalibrator()
+
+    @property
+    def is_fitted(self) -> bool:
+        return self._cal.is_fitted
+
+    def fit(self, predicted: np.ndarray, actual: np.ndarray) -> None:
+        """Fit on the "positive" side (e.g. p_over, p_btts_yes)."""
+        self._cal.fit(predicted, actual)
+
+    def calibrate_pair(
+        self, p_pos: float, p_neg: float,
+    ) -> tuple[float, float]:
+        """Calibrate a complementary pair (pos + neg ~ 1.0).
+
+        Returns (calibrated_pos, calibrated_neg) summing to 1.0.
+        """
+        if not self._cal.is_fitted:
+            return p_pos, p_neg
+        c_pos = self._cal.transform(p_pos)
+        c_neg = 1.0 - c_pos
+        # Guard against degenerate calibration
+        if c_pos < 0 or c_neg < 0:
+            return p_pos, p_neg
+        return round(c_pos, 6), round(c_neg, 6)

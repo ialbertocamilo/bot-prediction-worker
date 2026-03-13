@@ -1,13 +1,13 @@
 """add league_hyperparams table
 
-Revision ID: d8e9f0a1b2c3
+Revision ID: d9f0a1b2c3d4
 Revises: c7d8e9f0a1b2
 Create Date: 2026-03-12
 """
 from alembic import op
 import sqlalchemy as sa
 
-revision = "d8e9f0a1b2c3"
+revision = "d9f0a1b2c3d4"
 down_revision = "c7d8e9f0a1b2"
 branch_labels = None
 depends_on = None

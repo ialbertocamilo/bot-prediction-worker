@@ -24,43 +24,38 @@ def _fair_odds(prob: float) -> float:
     return round(1.0 / prob, 2)
 
 
-def _implied_prob(odds: float) -> float:
-    if odds <= 0:
-        return 0.0
-    return 1.0 / odds
-
-
-def _kelly(prob: float, odds: float) -> float:
-    b = odds - 1.0
-    if b <= 0:
-        return 0.0
-    return max((b * prob - (1.0 - prob)) / b, 0.0)
-
-
-def _ev(prob: float, odds: float) -> float:
-    return prob * (odds - 1.0) - (1.0 - prob)
-
-
 def _value_analysis(p_home: float, p_draw: float, p_away: float,
                     odds_home: float, odds_draw: float, odds_away: float) -> dict:
-    """Compare model probabilities against bookmaker odds."""
+    """Compare model probabilities against bookmaker odds.
+
+    Uses the centralised power-method (odds_to_probs) and multiplicative
+    edge (compute_edge) from value_service so all endpoints report
+    identical mathematics.
+    """
+    market_probs = odds_to_probs(odds_home, odds_draw, odds_away)
+    model_probs = {"p_home": p_home, "p_draw": p_draw, "p_away": p_away}
+    edges = compute_edge(model_probs, market_probs)
+
     markets = []
-    for label, prob, odd in [("home", p_home, odds_home),
-                              ("draw", p_draw, odds_draw),
-                              ("away", p_away, odds_away)]:
-        implied = _implied_prob(odd)
-        ev = _ev(prob, odd)
-        kelly_f = _kelly(prob, odd)
+    for label, prob, odd, edge_key in [
+        ("home", p_home, odds_home, "edge_home"),
+        ("draw", p_draw, odds_draw, "edge_draw"),
+        ("away", p_away, odds_away, "edge_away"),
+    ]:
+        p_market = market_probs.get(f"p_{label}", 0.0)
+        edge = edges[edge_key]
+        b = odd - 1.0
+        kelly_f = max((b * prob - (1.0 - prob)) / b, 0.0) if b > 0 else 0.0
         markets.append({
             "market": label,
             "bookmaker_odds": odd,
             "model_prob": round(prob, 4),
-            "implied_prob": round(implied, 4),
-            "edge": round(prob - implied, 4),
-            "ev": round(ev, 4),
+            "implied_prob": round(p_market, 4),
+            "edge": round(edge, 4),
+            "ev": round(edge, 4),
             "kelly_fraction": round(kelly_f, 4),
             "kelly_quarter": round(kelly_f * 0.25, 4),
-            "is_value": ev > 0,
+            "is_value": edge > 0,
         })
     return {
         "value_bets": [m for m in markets if m["is_value"]],

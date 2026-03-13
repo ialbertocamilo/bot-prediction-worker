@@ -22,7 +22,7 @@ from app.repositories.prediction.team_rating_repository import TeamRatingReposit
 from app.db.models.prediction.prediction_eval import PredictionEval
 from app.repositories.prediction.prediction_eval_repository import PredictionEvalRepository
 from app.services.prediction.dixon_coles import DixonColesModel, DixonColesParams, MatchData
-from app.services.prediction.calibration import MultiClassPlattCalibrator
+from app.services.prediction.calibration import MultiClassPlattCalibrator, BinaryPlattCalibrator
 from app.services.prediction.schemas import MatchPredictionResult
 from config import HOME_ADVANTAGE, TIME_DECAY, XG_REG_WEIGHT, MIN_XG_MATCHES, CALIBRATION_ENABLED, CALIBRATION_MIN_SAMPLES
 
@@ -44,7 +44,9 @@ class PredictionService:
         self.rating_repo = TeamRatingRepository(db)
         self.hp_repo = LeagueHyperparamsRepository(db)
         self.eval_repo = PredictionEvalRepository(db)
-        self._calibrator: MultiClassPlattCalibrator | None = None
+        self._calibrators: dict[int | None, MultiClassPlattCalibrator] = {}
+        self._ou25_calibrators: dict[int | None, BinaryPlattCalibrator] = {}
+        self._btts_calibrators: dict[int | None, BinaryPlattCalibrator] = {}
 
     def _league_params(
         self, league_id: int,
@@ -138,9 +140,20 @@ class PredictionService:
                 )
 
             # ── Platt calibration (optional post-processing) ──
-            cal = self._build_calibrator()
+            cal = self._build_calibrator(league_id=match.league_id)
             cal_home, cal_draw, cal_away = self._calibrate_1x2(
                 result["p_home"], result["p_draw"], result["p_away"],
+                league_id=match.league_id,
+            )
+
+            # Calibrate Over/Under 2.5 and BTTS via binary Platt scaling
+            cal_over_25, cal_under_25 = self._calibrate_ou25(
+                result["p_over_2_5"], result["p_under_2_5"],
+                league_id=match.league_id,
+            )
+            cal_btts_yes, cal_btts_no = self._calibrate_btts(
+                result["p_btts_yes"], result["p_btts_no"],
+                league_id=match.league_id,
             )
 
             prediction = self.prediction_repo.create(
@@ -151,18 +164,18 @@ class PredictionService:
                 p_away=cal_away,
                 p_over_1_5=result["p_over_1_5"],
                 p_under_1_5=result["p_under_1_5"],
-                p_over_2_5=result["p_over_2_5"],
-                p_under_2_5=result["p_under_2_5"],
+                p_over_2_5=cal_over_25,
+                p_under_2_5=cal_under_25,
                 p_over_3_5=result["p_over_3_5"],
                 p_under_3_5=result["p_under_3_5"],
-                p_btts_yes=result["p_btts_yes"],
-                p_btts_no=result["p_btts_no"],
+                p_btts_yes=cal_btts_yes,
+                p_btts_no=cal_btts_no,
                 xg_home=result["xg_home"],
                 xg_away=result["xg_away"],
                 top_scorelines=result["top_scorelines"],
                 data_quality=(
                     f"{len(match_data)}_matches_{len(xg_priors)}_xg_teams"
-                    f"{'_calibrated_1x2' if cal.is_fitted else '_raw'}"
+                    f"{'_calibrated' if cal.is_fitted else '_raw'}"
                 ),
             )
 
@@ -182,65 +195,176 @@ class PredictionService:
 
     # ── Platt calibration helpers ──────────────────────────────────────
 
-    def _build_calibrator(self) -> MultiClassPlattCalibrator:
+    def _build_calibrator(self, league_id: int | None = None) -> MultiClassPlattCalibrator:
         """Train a MultiClassPlattCalibrator from historical prediction_eval data.
 
-        Builds three independent calibrators (home / draw / away) so each
-        outcome class gets its own logistic mapping.
+        Tries per-league calibration first.  Falls back to global (all leagues)
+        when the league has fewer than CALIBRATION_MIN_SAMPLES evaluated predictions.
         """
-        if self._calibrator is not None:
-            return self._calibrator
+        if league_id in self._calibrators:
+            return self._calibrators[league_id]
 
         calibrator = MultiClassPlattCalibrator()
         if not CALIBRATION_ENABLED:
-            self._calibrator = calibrator
-            return calibrator
-
-        # Gather evaluated predictions: raw model prob vs actual binary outcome
-        stmt = (
-            select(Prediction.p_home, Prediction.p_draw, Prediction.p_away,
-                   PredictionEval.actual_outcome)
-            .join(PredictionEval, PredictionEval.prediction_id == Prediction.id)
-        )
-        rows = list(self.db.execute(stmt))
-        if len(rows) < CALIBRATION_MIN_SAMPLES:
-            logger.info(
-                "Calibration skipped: %d evaluated predictions < %d minimum",
-                len(rows), CALIBRATION_MIN_SAMPLES,
-            )
-            self._calibrator = calibrator
+            self._calibrators[league_id] = calibrator
             return calibrator
 
         import numpy as np
+
+        # Try per-league first
+        rows = self._fetch_eval_rows(league_id=league_id)
+        if len(rows) < CALIBRATION_MIN_SAMPLES:
+            logger.info(
+                "Per-league calibration skipped (league=%s, %d < %d), trying global fallback",
+                league_id, len(rows), CALIBRATION_MIN_SAMPLES,
+            )
+            rows = self._fetch_eval_rows(league_id=None)
+
+        if len(rows) < CALIBRATION_MIN_SAMPLES:
+            logger.info(
+                "Global calibration skipped: %d evaluated predictions < %d minimum",
+                len(rows), CALIBRATION_MIN_SAMPLES,
+            )
+            self._calibrators[league_id] = calibrator
+            return calibrator
+
         p_home_arr = np.array([r.p_home for r in rows], dtype=np.float64)
         p_draw_arr = np.array([r.p_draw for r in rows], dtype=np.float64)
         p_away_arr = np.array([r.p_away for r in rows], dtype=np.float64)
         outcomes = np.array([r.actual_outcome for r in rows])
 
         calibrator.fit(p_home_arr, p_draw_arr, p_away_arr, outcomes)
-        self._calibrator = calibrator
+        self._calibrators[league_id] = calibrator
         return calibrator
+
+    def _build_ou25_calibrator(self, league_id: int | None = None) -> BinaryPlattCalibrator:
+        """Build a binary Platt calibrator for Over/Under 2.5 goals."""
+        if league_id in self._ou25_calibrators:
+            return self._ou25_calibrators[league_id]
+
+        cal = BinaryPlattCalibrator()
+        if not CALIBRATION_ENABLED:
+            self._ou25_calibrators[league_id] = cal
+            return cal
+
+        import numpy as np
+
+        rows = self._fetch_ou_btts_rows(league_id=league_id)
+        if len(rows) < CALIBRATION_MIN_SAMPLES:
+            rows = self._fetch_ou_btts_rows(league_id=None)
+        if len(rows) < CALIBRATION_MIN_SAMPLES:
+            self._ou25_calibrators[league_id] = cal
+            return cal
+
+        predicted = np.array([r.p_over_2_5 for r in rows if r.p_over_2_5 is not None], dtype=np.float64)
+        actual = np.array([
+            1.0 if (r.home_goals + r.away_goals) > 2 else 0.0
+            for r in rows if r.p_over_2_5 is not None
+        ], dtype=np.float64)
+
+        if len(predicted) >= CALIBRATION_MIN_SAMPLES:
+            cal.fit(predicted, actual)
+        self._ou25_calibrators[league_id] = cal
+        return cal
+
+    def _build_btts_calibrator(self, league_id: int | None = None) -> BinaryPlattCalibrator:
+        """Build a binary Platt calibrator for BTTS (Both Teams To Score)."""
+        if league_id in self._btts_calibrators:
+            return self._btts_calibrators[league_id]
+
+        cal = BinaryPlattCalibrator()
+        if not CALIBRATION_ENABLED:
+            self._btts_calibrators[league_id] = cal
+            return cal
+
+        import numpy as np
+
+        rows = self._fetch_ou_btts_rows(league_id=league_id)
+        if len(rows) < CALIBRATION_MIN_SAMPLES:
+            rows = self._fetch_ou_btts_rows(league_id=None)
+        if len(rows) < CALIBRATION_MIN_SAMPLES:
+            self._btts_calibrators[league_id] = cal
+            return cal
+
+        predicted = np.array([r.p_btts_yes for r in rows if r.p_btts_yes is not None], dtype=np.float64)
+        actual = np.array([
+            1.0 if (r.home_goals > 0 and r.away_goals > 0) else 0.0
+            for r in rows if r.p_btts_yes is not None
+        ], dtype=np.float64)
+
+        if len(predicted) >= CALIBRATION_MIN_SAMPLES:
+            cal.fit(predicted, actual)
+        self._btts_calibrators[league_id] = cal
+        return cal
+
+    def _fetch_eval_rows(self, league_id: int | None = None) -> list:
+        """Fetch evaluated prediction rows for 1X2 calibration, optionally per-league."""
+        stmt = (
+            select(Prediction.p_home, Prediction.p_draw, Prediction.p_away,
+                   PredictionEval.actual_outcome)
+            .join(PredictionEval, PredictionEval.prediction_id == Prediction.id)
+        )
+        if league_id is not None:
+            stmt = stmt.join(Match, Match.id == Prediction.match_id).where(
+                Match.league_id == league_id,
+            )
+        return list(self.db.execute(stmt))
+
+    def _fetch_ou_btts_rows(self, league_id: int | None = None) -> list:
+        """Fetch prediction + actual goals rows for O/U and BTTS calibration."""
+        stmt = (
+            select(
+                Prediction.p_over_2_5, Prediction.p_btts_yes,
+                Match.home_goals, Match.away_goals,
+            )
+            .join(Match, Match.id == Prediction.match_id)
+            .where(Match.status == "FINISHED")
+            .where(Match.home_goals.isnot(None))
+            .where(Match.away_goals.isnot(None))
+        )
+        if league_id is not None:
+            stmt = stmt.where(Match.league_id == league_id)
+        return list(self.db.execute(stmt))
 
     def _calibrate_1x2(
         self,
         p_home: float, p_draw: float, p_away: float,
+        league_id: int | None = None,
     ) -> tuple[float, float, float]:
-        """Calibrate 1X2 probabilities using per-class Platt scaling.
+        """Calibrate 1X2 probabilities using per-league Platt scaling.
 
         Returns calibrated (home, draw, away) that sum to 1.0.
         If calibrator is not fitted the raw probabilities are returned unchanged.
         """
-        cal = self._build_calibrator()
+        cal = self._build_calibrator(league_id=league_id)
         if not cal.is_fitted:
             return p_home, p_draw, p_away
 
         c_home, c_draw, c_away = cal.calibrate_1x2(p_home, p_draw, p_away)
 
         logger.debug(
-            "Calibrated 1X2: (%.4f,%.4f,%.4f) → (%.4f,%.4f,%.4f)",
-            p_home, p_draw, p_away, c_home, c_draw, c_away,
+            "Calibrated 1X2 (league=%s): (%.4f,%.4f,%.4f) → (%.4f,%.4f,%.4f)",
+            league_id, p_home, p_draw, p_away, c_home, c_draw, c_away,
         )
         return c_home, c_draw, c_away
+
+    def _calibrate_ou25(
+        self,
+        p_over: float, p_under: float,
+        league_id: int | None = None,
+    ) -> tuple[float, float]:
+        """Calibrate Over/Under 2.5 using binary Platt scaling."""
+        cal = self._build_ou25_calibrator(league_id=league_id)
+        return cal.calibrate_pair(p_over, p_under)
+
+    def _calibrate_btts(
+        self,
+        p_yes: float, p_no: float,
+        league_id: int | None = None,
+    ) -> tuple[float, float]:
+        """Calibrate BTTS Yes/No using binary Platt scaling."""
+        cal = self._build_btts_calibrator(league_id=league_id)
+        return cal.calibrate_pair(p_yes, p_no)
 
     def _load_xg_map(self, match_ids: list[int]) -> dict[int, dict[int, float]]:
         """Load xG values from match_stats for given match IDs."""

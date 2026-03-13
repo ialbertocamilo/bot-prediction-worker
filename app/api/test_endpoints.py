@@ -3,24 +3,24 @@ API endpoints — read-only HTTP interface mirroring bot commands + pipeline too
 
 GET  /leagues              — List canonical (deduplicated) leagues
 GET  /matches?league=N     — Upcoming scheduled matches (optional canonical league filter)
-GET  /predict?match_number=N — Prediction for match N from /matches listing
+GET  /predict?match_id=N   — Prediction for match by ID (stateless)
 
 POST /backtest             — Walk-forward backtesting
 POST /rolling_retrain      — Rolling retraining
 POST /optimize_model       — Hyperparameter grid search
+POST /seed_leagues         — Ingest results + fixtures
 
-These endpoints do NOT modify production services or their logic.
-They call existing services as-is and return results as JSON.
+All endpoints are synchronous ``def`` so FastAPI dispatches them to an
+external threadpool automatically — safe for blocking SQLAlchemy / ML calls
+without stalling the async event loop.
 """
 from __future__ import annotations
 
-import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -42,12 +42,12 @@ router = APIRouter()
 
 class BacktestRequest(BaseModel):
     league_id: int = Field(..., description="League ID to backtest")
-    from_date: str | None = Field(None, description="Start date YYYY-MM-DD (optional)")
+    from_date: date | None = Field(None, description="Start date YYYY-MM-DD (optional)")
 
 
 class RollingRetrainRequest(BaseModel):
     league_id: int = Field(..., description="League ID")
-    from_date: str | None = Field(None, description="Start date YYYY-MM-DD (optional)")
+    from_date: date | None = Field(None, description="Start date YYYY-MM-DD (optional)")
     dry_run: bool = Field(True, description="If true, no DB writes")
 
 
@@ -57,69 +57,10 @@ class OptimizeRequest(BaseModel):
     n_iter: int = Field(30, ge=1, le=500, description="Max random combos (only for 'random' mode)")
 
 
-# ── League-keyed match cache (stateless-friendly) ────────────────────────
-
-import time as _time
-
-_MATCH_CACHE_TTL = 300  # 5 minutes
-
-
-class _MatchCache:
-    """League-keyed cache with lazy asyncio.Lock (avoids module-level deadlock).
-
-    Each entry is keyed by canonical league index (None = all leagues) and
-    stores {match_number → match_id} for fast lookup, plus a TTL timestamp.
-    """
-
-    def __init__(self) -> None:
-        self._lock: asyncio.Lock | None = None
-        self._store: dict[int | None, tuple[float, dict[int, int]]] = {}
-
-    def _get_lock(self) -> asyncio.Lock:
-        """Lazily create the lock inside the running event loop."""
-        if self._lock is None:
-            self._lock = asyncio.Lock()
-        return self._lock
-
-    async def update(
-        self, league_key: int | None, number_to_id: dict[int, int],
-    ) -> None:
-        async with self._get_lock():
-            self._store[league_key] = (_time.monotonic(), dict(number_to_id))
-
-    async def get_match_id(
-        self, league_key: int | None, match_number: int,
-    ) -> int | None:
-        """Return match_id for 1-based match_number within a league listing."""
-        async with self._get_lock():
-            entry = self._store.get(league_key)
-            if entry is None:
-                return None
-            ts, mapping = entry
-            if _time.monotonic() - ts > _MATCH_CACHE_TTL:
-                self._store.pop(league_key, None)
-                return None
-            return mapping.get(match_number)
-
-    async def get_size(self, league_key: int | None) -> int:
-        async with self._get_lock():
-            entry = self._store.get(league_key)
-            if entry is None:
-                return 0
-            ts, mapping = entry
-            if _time.monotonic() - ts > _MATCH_CACHE_TTL:
-                self._store.pop(league_key, None)
-                return 0
-            return len(mapping)
-
-
-_match_cache = _MatchCache()
-
-
 # ── GET /leagues ──────────────────────────────────────────────────────────
 
 @router.get("/leagues")
-def list_leagues(db: Session = Depends(get_db)):
+def list_leagues(db: Session = Depends(get_db)) -> dict:
     """Return canonical (deduplicated) leagues with match counts."""
     svc = CanonicalLeagueService(db)
     leagues = svc.list_leagues()
@@ -147,30 +88,25 @@ def list_leagues(db: Session = Depends(get_db)):
 # ── GET /matches ──────────────────────────────────────────────────────────
 
 @router.get("/matches")
-async def list_matches(
+def list_matches(
     league: int | None = Query(None, description="Canonical league index (from /leagues)"),
     db: Session = Depends(get_db),
 ) -> dict:
     """Return upcoming scheduled matches (deduplicated across providers)."""
     svc = CanonicalLeagueService(db)
 
-    # ── Validation (pure CPU — no threadpool needed) ──
     if league is not None:
-        all_leagues = await run_in_threadpool(svc.list_leagues)
+        all_leagues = svc.list_leagues()
         if league < 1 or league > len(all_leagues):
             raise HTTPException(
                 status_code=400,
                 detail=f"league out of range. Valid: 1-{len(all_leagues)}",
             )
-        await run_in_threadpool(svc.auto_ingest_if_empty, league)
+        svc.auto_ingest_if_empty(league)
 
-    # ── Blocking I/O: only the DB query goes into the threadpool ──
-    upcoming = await run_in_threadpool(svc.get_upcoming, canonical_index=league)
+    upcoming = svc.get_upcoming(canonical_index=league)
 
-    # ── Response construction (pure CPU) ──
     items: list[dict] = []
-    number_to_id: dict[int, int] = {}
-
     for idx, m in enumerate(upcoming[:30], 1):
         items.append({
             "number": idx,
@@ -182,10 +118,6 @@ async def list_matches(
             "utc_date": m.utc_date.isoformat() if m.utc_date else None,
             "round": m.round,
         })
-        number_to_id[idx] = m.id
-
-    # Cache keyed by league index — avoids cross-user overwrites
-    await _match_cache.update(league, number_to_id)
 
     return {"count": len(items), "league": league, "matches": items}
 
@@ -193,39 +125,12 @@ async def list_matches(
 # ── GET /predict ──────────────────────────────────────────────────────────
 
 @router.get("/predict")
-async def predict_match(
-    match_id: int | None = Query(None, ge=1, description="Direct match ID (preferred, stateless)"),
-    match_number: int | None = Query(None, ge=1, description="Number from /matches listing (legacy)"),
-    league: int | None = Query(None, description="League index used in /matches (for cache lookup)"),
+def predict_match(
+    match_id: int = Query(..., ge=1, description="Match ID (from /matches listing)"),
     db: Session = Depends(get_db),
 ) -> dict:
-    """Predict a match.
-
-    Preferred (stateless): ``/predict?match_id=42``
-    Legacy shortcut:       ``/predict?match_number=3&league=1``
-    """
-    if match_id is None and match_number is None:
-        raise HTTPException(
-            status_code=400,
-            detail="Provide match_id (preferred) or match_number + league.",
-        )
-
-    # Resolve match_id from cache if only match_number was given
-    if match_id is None:
-        cache_size = await _match_cache.get_size(league)
-        if cache_size == 0:
-            raise HTTPException(
-                status_code=400,
-                detail="No cached listing for this league. Call GET /matches?league=N first, or use match_id directly.",
-            )
-        match_id = await _match_cache.get_match_id(league, match_number)  # type: ignore[arg-type]
-        if match_id is None:
-            raise HTTPException(
-                status_code=400,
-                detail=f"match_number out of range. Valid: 1-{cache_size}",
-            )
-
-    result = await run_in_threadpool(PredictionService(db).predict_match, match_id)
+    """Predict a match by its database ID (stateless)."""
+    result = PredictionService(db).predict_match(match_id)
     if result is None:
         raise HTTPException(
             status_code=404,
@@ -242,10 +147,10 @@ async def predict_match(
 # ── POST /backtest ────────────────────────────────────────────────────────
 
 @router.post("/backtest")
-async def run_backtest(req: BacktestRequest, db: Session = Depends(get_db)):
+def run_backtest(req: BacktestRequest, db: Session = Depends(get_db)) -> dict:
     """Run walk-forward backtesting (read-only, no persistence)."""
     svc = BacktestingService(db, league_id=req.league_id)
-    report = await run_in_threadpool(svc.run)
+    report = svc.run()
 
     if report.total_matches == 0:
         raise HTTPException(
@@ -271,16 +176,11 @@ async def run_backtest(req: BacktestRequest, db: Session = Depends(get_db)):
 # ── POST /rolling_retrain ────────────────────────────────────────────────
 
 @router.post("/rolling_retrain")
-async def run_rolling_retrain(req: RollingRetrainRequest, db: Session = Depends(get_db)):
+def run_rolling_retrain(req: RollingRetrainRequest, db: Session = Depends(get_db)) -> dict:
     """Run rolling retraining. Defaults to dry_run=true for safety."""
-    from_dt = None
-    if req.from_date:
-        try:
-            from_dt = datetime.strptime(req.from_date, "%Y-%m-%d").replace(
-                tzinfo=timezone.utc
-            )
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid from_date. Use YYYY-MM-DD.")
+    from_dt: datetime | None = None
+    if req.from_date is not None:
+        from_dt = datetime.combine(req.from_date, datetime.min.time(), tzinfo=timezone.utc)
 
     svc = RollingRetrainService(
         db=db,
@@ -288,13 +188,11 @@ async def run_rolling_retrain(req: RollingRetrainRequest, db: Session = Depends(
         from_date=from_dt,
         dry_run=req.dry_run,
     )
-    report = await run_in_threadpool(svc.run)
+    report = svc.run()
 
-    # Invalidate cached predictions after actual retrain
     invalidated = 0
     if not req.dry_run:
-        pred_svc = PredictionService(db)
-        invalidated = pred_svc.invalidate_stale_predictions()
+        invalidated = PredictionService(db).invalidate_stale_predictions()
 
     return {
         "league_id": req.league_id,
@@ -312,27 +210,23 @@ async def run_rolling_retrain(req: RollingRetrainRequest, db: Session = Depends(
 # ── POST /optimize_model ─────────────────────────────────────────────────
 
 @router.post("/optimize_model")
-async def run_optimize(req: OptimizeRequest, db: Session = Depends(get_db)):
+def run_optimize(req: OptimizeRequest, db: Session = Depends(get_db)) -> dict:
     """Run hyperparameter search. Modes: coarse, fine, full, random."""
     svc = HyperparameterOptimizationService(db=db, league_id=req.league_id)
 
-    def _run_search():
-        if req.mode == "coarse":
-            return svc.run_coarse()
-        elif req.mode == "fine":
-            return svc.run_fine()
-        elif req.mode == "random":
-            return svc.run_random(n_iter=req.n_iter)
-        return svc.run()
-
-    report = await run_in_threadpool(_run_search)
+    if req.mode == "coarse":
+        report = svc.run_coarse()
+    elif req.mode == "fine":
+        report = svc.run_fine()
+    elif req.mode == "random":
+        report = svc.run_random(n_iter=req.n_iter)
+    else:
+        report = svc.run()
 
     best = report.best
     ranked = report.ranked[:10]
 
-    # Invalidate cached predictions after optimization
-    pred_svc = PredictionService(db)
-    invalidated = pred_svc.invalidate_stale_predictions()
+    invalidated = PredictionService(db).invalidate_stale_predictions()
 
     return {
         "league_id": req.league_id,
@@ -375,7 +269,7 @@ class SeedRequest(BaseModel):
 
 
 @router.post("/seed_leagues")
-def seed_leagues(req: SeedRequest, db: Session = Depends(get_db)):
+def seed_leagues(req: SeedRequest, db: Session = Depends(get_db)) -> dict:
     """Ingest results + fixtures for configured leagues from ESPN."""
     svc = CanonicalLeagueService(db)
 
@@ -386,8 +280,6 @@ def seed_leagues(req: SeedRequest, db: Session = Depends(get_db)):
         total = svc.seed_all_leagues(days_back=req.days_back, days_ahead=req.days_ahead)
         ingested = {"_total": total}
 
-    # Fresh summary
-    svc2 = CanonicalLeagueService(db)
     summary = [
         {
             "index": lg.index,
@@ -397,7 +289,7 @@ def seed_leagues(req: SeedRequest, db: Session = Depends(get_db)):
             "scheduled": lg.scheduled_matches,
             "db_league_ids": lg.db_league_ids,
         }
-        for lg in svc2.list_leagues()
+        for lg in svc.list_leagues()
     ]
 
     return {"ingested": ingested, "leagues": summary}
