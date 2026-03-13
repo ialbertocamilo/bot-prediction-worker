@@ -293,3 +293,14 @@ def seed_leagues(req: SeedRequest, db: Session = Depends(get_db)) -> dict:
     ]
 
     return {"ingested": ingested, "leagues": summary}
+
+
+# ── POST /sync_domestic_keys ──────────────────────────────────────────────
+
+@router.post("/sync_domestic_keys")
+def sync_domestic_keys(db: Session = Depends(get_db)) -> dict:
+    """Backfill domestic_league_key for teams with NULL based on match history."""
+    svc = CanonicalLeagueService(db)
+    updated = svc.sync_historical_domestic_keys()
+    db.commit()
+    return {"teams_updated": updated}

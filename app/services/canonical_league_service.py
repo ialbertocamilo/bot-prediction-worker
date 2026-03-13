@@ -142,6 +142,29 @@ LEAGUE_GROUPS: list[_LeagueGroup] = [
 ]
 
 
+# ── Lookup puro: league_name → domestic canonical key ─────────────────────
+# International tournaments (country=None) never return a key.
+
+_DOMESTIC_GROUPS: list[_LeagueGroup] = [
+    g for g in LEAGUE_GROUPS if g.country is not None
+]
+
+
+def domestic_key_for_league_name(league_name: str) -> str | None:
+    """Return the canonical key if *league_name* belongs to a domestic league.
+
+    Pure function — uses only LEAGUE_GROUPS config, no DB access.
+    Returns None for international tournaments or unknown leagues.
+    """
+    ln = league_name.lower().strip()
+    for g in _DOMESTIC_GROUPS:
+        for p in g.league_names:
+            pl = p.lower().strip()
+            if ln == pl or pl in ln or ln in pl:
+                return g.key
+    return None
+
+
 # ── Tipo público para consumidores ────────────────────────────────────────
 
 
@@ -536,3 +559,88 @@ class CanonicalLeagueService:
                 seen.add(sig)
                 result.append(m)
         return result
+
+    # ── domestic_league_key backfill ──────────────────────────────────────
+
+    def sync_historical_domestic_keys(self) -> int:
+        """Backfill domestic_league_key for teams that have NULL.
+
+        For each team without a key, look at its match history in domestic
+        leagues (resolved via LEAGUE_GROUPS config).  The league where the
+        team has the most matches is chosen as its domestic anchor.
+
+        Returns the number of teams updated.
+        """
+        from app.db.models.football.team import Team
+
+        # Build league_id → canonical_key for domestic groups only
+        domestic_id_to_key: dict[int, str] = {}
+        for g in _DOMESTIC_GROUPS:
+            for lid in self._resolved.get(g.key, []):
+                domestic_id_to_key[lid] = g.key
+
+        if not domestic_id_to_key:
+            return 0
+
+        domestic_league_ids = list(domestic_id_to_key.keys())
+
+        # Teams still missing the key
+        teams = list(
+            self.db.scalars(
+                select(Team).where(Team.domestic_league_key.is_(None))
+            ).all()
+        )
+        if not teams:
+            return 0
+
+        team_ids = [t.id for t in teams]
+
+        # One query: count matches per (team, league) for domestic leagues
+        home_q = (
+            select(
+                Match.home_team_id.label("team_id"),
+                Match.league_id,
+                func.count(Match.id).label("cnt"),
+            )
+            .where(Match.home_team_id.in_(team_ids))
+            .where(Match.league_id.in_(domestic_league_ids))
+            .group_by(Match.home_team_id, Match.league_id)
+        )
+        away_q = (
+            select(
+                Match.away_team_id.label("team_id"),
+                Match.league_id,
+                func.count(Match.id).label("cnt"),
+            )
+            .where(Match.away_team_id.in_(team_ids))
+            .where(Match.league_id.in_(domestic_league_ids))
+            .group_by(Match.away_team_id, Match.league_id)
+        )
+
+        # Aggregate: team_id → {league_id: count}
+        counts: dict[int, dict[int, int]] = {}
+        for row in self.db.execute(home_q):
+            counts.setdefault(row[0], {}).setdefault(row[1], 0)
+            counts[row[0]][row[1]] += row[2]
+        for row in self.db.execute(away_q):
+            counts.setdefault(row[0], {}).setdefault(row[1], 0)
+            counts[row[0]][row[1]] += row[2]
+
+        updated = 0
+        team_map = {t.id: t for t in teams}
+        for tid, league_counts in counts.items():
+            if not league_counts:
+                continue
+            best_lid = max(league_counts, key=league_counts.get)  # type: ignore[arg-type]
+            key = domestic_id_to_key.get(best_lid)
+            if key and tid in team_map:
+                team_map[tid].domestic_league_key = key
+                updated += 1
+
+        if updated:
+            self.db.flush()
+
+        logger.info(
+            "sync_historical_domestic_keys: %d/%d teams updated", updated, len(teams),
+        )
+        return updated

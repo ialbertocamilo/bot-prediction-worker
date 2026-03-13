@@ -14,6 +14,7 @@ from app.repositories.football.match_repository import MatchRepository
 from app.repositories.football.season_repository import SeasonRepository
 from app.repositories.football.team_repository import TeamRepository
 from app.repositories.football.venue_repository import VenueRepository
+from app.services.canonical_league_service import domestic_key_for_league_name
 
 
 class MatchIngestService:
@@ -111,6 +112,14 @@ class MatchIngestService:
             external_team_id=canonical_match.away_team_external_id,
             team_name=canonical_match.away_team_name,
         )
+
+        # Stamp domestic_league_key on-the-fly for domestic leagues
+        domestic_key = domestic_key_for_league_name(
+            canonical_match.league_name or "",
+        )
+        if domestic_key:
+            self._stamp_domestic_key(home_team_id, domestic_key)
+            self._stamp_domestic_key(away_team_id, domestic_key)
 
         venue_id: int | None = None
 
@@ -260,3 +269,9 @@ class MatchIngestService:
             )
 
         return existing_team.id
+
+    def _stamp_domestic_key(self, team_id: int, key: str) -> None:
+        """Set domestic_league_key if currently NULL (no-op otherwise)."""
+        team = self.team_repo.get_by_id(team_id)
+        if team is not None and team.domestic_league_key is None:
+            team.domestic_league_key = key
