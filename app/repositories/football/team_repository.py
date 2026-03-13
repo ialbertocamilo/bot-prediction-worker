@@ -101,6 +101,21 @@ class TeamRepository:
             founded_year=founded_year,
         )
 
+    def search_by_name(self, query: str, limit: int = 20) -> list[Team]:
+        pattern = f"%{query}%"
+        stmt = (
+            select(Team)
+            .where(
+                or_(
+                    Team.name.ilike(pattern),
+                    Team.short_name.ilike(pattern),
+                )
+            )
+            .order_by(Team.name.asc())
+            .limit(limit)
+        )
+        return list(self.db.scalars(stmt).all())
+
     def list_all(self) -> list[Team]:
         stmt = select(Team).order_by(Team.name.asc())
         return list(self.db.scalars(stmt).all())

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.db.models.football.match import Match
@@ -195,4 +195,23 @@ class MatchRepository:
             .where(Match.status.in_(["IN_PLAY", "PAUSED"]))
             .order_by(Match.utc_date.asc())
         )
+        return list(self.db.scalars(stmt).all())
+
+    def distinct_league_ids_for_team(
+        self,
+        team_id: int,
+        cutoff: datetime | None = None,
+    ) -> list[int]:
+        stmt = (
+            select(Match.league_id)
+            .where(
+                or_(
+                    Match.home_team_id == team_id,
+                    Match.away_team_id == team_id,
+                )
+            )
+            .distinct()
+        )
+        if cutoff is not None:
+            stmt = stmt.where(Match.utc_date >= cutoff)
         return list(self.db.scalars(stmt).all())
