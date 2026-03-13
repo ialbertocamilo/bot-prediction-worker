@@ -8,10 +8,10 @@ import math
 from datetime import datetime, timezone
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, noload
 
 from app.db.models.football.match import Match
-from app.db.models.football.match_stats import MatchStats
 from app.db.models.prediction.prediction import Prediction
 from app.repositories.football.match_repository import MatchRepository
 from app.repositories.prediction.league_hyperparams_repository import LeagueHyperparamsRepository
@@ -22,8 +22,9 @@ from app.repositories.prediction.team_rating_repository import TeamRatingReposit
 from app.db.models.prediction.prediction_eval import PredictionEval
 from app.repositories.prediction.prediction_eval_repository import PredictionEvalRepository
 from app.services.prediction.dixon_coles import DixonColesModel, DixonColesParams, MatchData
-from app.services.prediction.calibration import PlattCalibrator
-from config import HOME_ADVANTAGE, TIME_DECAY, XG_REG_WEIGHT, CALIBRATION_ENABLED, CALIBRATION_MIN_SAMPLES
+from app.services.prediction.calibration import MultiClassPlattCalibrator
+from app.services.prediction.schemas import MatchPredictionResult
+from config import HOME_ADVANTAGE, TIME_DECAY, XG_REG_WEIGHT, MIN_XG_MATCHES, CALIBRATION_ENABLED, CALIBRATION_MIN_SAMPLES
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +44,7 @@ class PredictionService:
         self.rating_repo = TeamRatingRepository(db)
         self.hp_repo = LeagueHyperparamsRepository(db)
         self.eval_repo = PredictionEvalRepository(db)
-        self._calibrator: PlattCalibrator | None = None
+        self._calibrator: MultiClassPlattCalibrator | None = None
 
     def _league_params(
         self, league_id: int,
@@ -59,7 +60,7 @@ class PredictionService:
         ha = hp.home_advantage if hp and hp.home_advantage is not None else HOME_ADVANTAGE
         return td, xg_w, ha
 
-    def predict_match(self, match_id: int) -> dict | None:
+    def predict_match(self, match_id: int) -> MatchPredictionResult | None:
         """
         Predict a match using Dixon-Coles fitted on the same league's
         historical data.  Persists features, ratings and prediction to the DB.
@@ -79,136 +80,118 @@ class PredictionService:
             model_id=model_rec.id,
         )
         if existing is not None:
-            return self._to_dict(existing, match)
-
-        training = self._training_matches(match.league_id, match.id)
-        if len(training) < MIN_MATCHES:
-            return None
+            return self._to_result(existing, match)
 
         # Use the target match date as temporal reference (consistent with
         # backtesting/rolling retrain).  Fall back to now for safety.
         ref_ts = match.utc_date or datetime.now(timezone.utc)
+
+        training = self._training_matches(match.league_id, match.id, before_date=ref_ts)
+        if len(training) < MIN_MATCHES:
+            return None
+
         td, xg_w, ha = self._league_params(match.league_id)
         xg_map = self._load_xg_map([m.id for m in training])
-        match_data: list[MatchData] = []
-        # Collect per-team xG aggregates for regularization priors
-        xg_for_lists: dict[int, list[float]] = {}
-        xg_against_lists: dict[int, list[float]] = {}
-        for m in training:
-            if m.home_goals is None or m.away_goals is None:
-                continue
-            days_ago = 0.0
-            if m.utc_date:
-                delta = (ref_ts - m.utc_date).total_seconds() / 86400.0
-                days_ago = max(delta, 0.0)
-            w = math.exp(-td * days_ago)
 
-            match_data.append(MatchData(
-                home_team_id=m.home_team_id,
-                away_team_id=m.away_team_id,
-                home_goals=m.home_goals,
-                away_goals=m.away_goals,
-                weight=w,
-            ))
-
-            # Accumulate xG per team (for = own offensive, against = opponent)
-            pair = xg_map.get(m.id, {})
-            h_xg = pair.get(m.home_team_id)
-            a_xg = pair.get(m.away_team_id)
-            if h_xg is not None and a_xg is not None:
-                xg_for_lists.setdefault(m.home_team_id, []).append(h_xg)
-                xg_against_lists.setdefault(m.home_team_id, []).append(a_xg)
-                xg_for_lists.setdefault(m.away_team_id, []).append(a_xg)
-                xg_against_lists.setdefault(m.away_team_id, []).append(h_xg)
+        from app.services.prediction.training_data import build_training_data
+        match_data, xg_priors = build_training_data(
+            training, ref_ts, td, xg_map, MIN_XG_MATCHES,
+        )
 
         if len(match_data) < MIN_MATCHES:
             return None
 
         dc = DixonColesModel(time_decay=td, home_adv_init=ha)
-
-        # Build xG priors: {team_id: (avg_xg_for, avg_xg_against)}
-        xg_priors: dict[int, tuple[float, float]] = {}
-        for tid in set(xg_for_lists) & set(xg_against_lists):
-            avg_for = sum(xg_for_lists[tid]) / len(xg_for_lists[tid])
-            avg_against = sum(xg_against_lists[tid]) / len(xg_against_lists[tid])
-            xg_priors[tid] = (avg_for, avg_against)
-
         params = dc.fit(match_data, xg_priors=xg_priors, xg_weight=xg_w)
         result = dc.predict_match(match.home_team_id, match.away_team_id, params)
 
-        self.feature_repo.upsert(
-            match_id=match_id,
-            model_id=model_rec.id,
-            lambda_home=result["lambda_home"],
-            lambda_away=result["lambda_away"],
-            rating_home=result["attack_home"],
-            rating_away=result["attack_away"],
-            rating_diff=result["attack_home"] - result["attack_away"],
-            home_goals_for_avg=result["xg_home"],
-            home_goals_against_avg=None,
-            away_goals_for_avg=result["xg_away"],
-            away_goals_against_avg=None,
-        )
-
-        as_of = datetime.now(timezone.utc)
-        for tid in (match.home_team_id, match.away_team_id):
-            att = params.attack.get(tid, 0.0)
-            dfn = params.defense.get(tid, 0.0)
-            att = max(-MAX_ATTACK_DEFENSE, min(MAX_ATTACK_DEFENSE, att))
-            dfn = max(-MAX_ATTACK_DEFENSE, min(MAX_ATTACK_DEFENSE, dfn))
-            self.rating_repo.upsert_by_match(
-                model_id=model_rec.id,
-                team_id=tid,
-                as_of_match_id=match_id,
-                rating=att - dfn,
-                attack=att,
-                defense=dfn,
-                as_of_date=as_of,
+        model_id = model_rec.id
+        try:
+            self.feature_repo.upsert(
+                match_id=match_id,
+                model_id=model_id,
+                lambda_home=result["lambda_home"],
+                lambda_away=result["lambda_away"],
+                rating_home=result["attack_home"],
+                rating_away=result["attack_away"],
+                rating_diff=result["attack_home"] - result["attack_away"],
+                home_goals_for_avg=result["xg_home"],
+                home_goals_against_avg=None,
+                away_goals_for_avg=result["xg_away"],
+                away_goals_against_avg=None,
             )
 
-        # ── Platt calibration (optional post-processing) ──
-        cal_home, cal_draw, cal_away = self._calibrate_1x2(
-            result["p_home"], result["p_draw"], result["p_away"],
-        )
+            as_of = datetime.now(timezone.utc)
+            for tid in (match.home_team_id, match.away_team_id):
+                att = params.attack.get(tid, 0.0)
+                dfn = params.defense.get(tid, 0.0)
+                att = max(-MAX_ATTACK_DEFENSE, min(MAX_ATTACK_DEFENSE, att))
+                dfn = max(-MAX_ATTACK_DEFENSE, min(MAX_ATTACK_DEFENSE, dfn))
+                self.rating_repo.upsert_by_match(
+                    model_id=model_id,
+                    team_id=tid,
+                    as_of_match_id=match_id,
+                    rating=att - dfn,
+                    attack=att,
+                    defense=dfn,
+                    as_of_date=as_of,
+                )
 
-        prediction = self.prediction_repo.create(
-            match_id=match_id,
-            model_id=model_rec.id,
-            p_home=cal_home,
-            p_draw=cal_draw,
-            p_away=cal_away,
-            p_over_1_5=result["p_over_1_5"],
-            p_under_1_5=result["p_under_1_5"],
-            p_over_2_5=result["p_over_2_5"],
-            p_under_2_5=result["p_under_2_5"],
-            p_over_3_5=result["p_over_3_5"],
-            p_under_3_5=result["p_under_3_5"],
-            p_btts_yes=result["p_btts_yes"],
-            p_btts_no=result["p_btts_no"],
-            xg_home=result["xg_home"],
-            xg_away=result["xg_away"],
-            top_scorelines=result["top_scorelines"],
-            data_quality=f"{len(match_data)}_matches_{len(xg_priors)}_xg_teams",
-        )
+            # ── Platt calibration (optional post-processing) ──
+            cal = self._build_calibrator()
+            cal_home, cal_draw, cal_away = self._calibrate_1x2(
+                result["p_home"], result["p_draw"], result["p_away"],
+            )
 
-        # Flush only — caller (worker) is responsible for commit.
-        self.db.flush()
-        return self._to_dict(prediction, match)
+            prediction = self.prediction_repo.create(
+                match_id=match_id,
+                model_id=model_id,
+                p_home=cal_home,
+                p_draw=cal_draw,
+                p_away=cal_away,
+                p_over_1_5=result["p_over_1_5"],
+                p_under_1_5=result["p_under_1_5"],
+                p_over_2_5=result["p_over_2_5"],
+                p_under_2_5=result["p_under_2_5"],
+                p_over_3_5=result["p_over_3_5"],
+                p_under_3_5=result["p_under_3_5"],
+                p_btts_yes=result["p_btts_yes"],
+                p_btts_no=result["p_btts_no"],
+                xg_home=result["xg_home"],
+                xg_away=result["xg_away"],
+                top_scorelines=result["top_scorelines"],
+                data_quality=(
+                    f"{len(match_data)}_matches_{len(xg_priors)}_xg_teams"
+                    f"{'_calibrated_1x2' if cal.is_fitted else '_raw'}"
+                ),
+            )
+
+            self.db.flush()
+            return self._to_result(prediction, match)
+        except IntegrityError:
+            self.db.rollback()
+            match = self.match_repo.get_by_id(match_id)
+            if match is None:
+                return None
+            existing = self.prediction_repo.latest_for_match_and_model(
+                match_id, model_id,
+            )
+            if existing is not None:
+                return self._to_result(existing, match)
+            return None
 
     # ── Platt calibration helpers ──────────────────────────────────────
 
-    def _build_calibrator(self) -> PlattCalibrator:
-        """Train a PlattCalibrator from historical prediction_eval data.
+    def _build_calibrator(self) -> MultiClassPlattCalibrator:
+        """Train a MultiClassPlattCalibrator from historical prediction_eval data.
 
-        Builds three outcome-specific calibrators (home/draw/away) packed
-        into a single instance trained on the *home-win* outcome for
-        simplicity.  In practice, we calibrate each 1X2 leg independently
-        then re-normalise.
+        Builds three independent calibrators (home / draw / away) so each
+        outcome class gets its own logistic mapping.
         """
         if self._calibrator is not None:
             return self._calibrator
 
-        calibrator = PlattCalibrator()
+        calibrator = MultiClassPlattCalibrator()
         if not CALIBRATION_ENABLED:
             self._calibrator = calibrator
             return calibrator
@@ -228,11 +211,13 @@ class PredictionService:
             self._calibrator = calibrator
             return calibrator
 
-        # Train on home-win probabilities (most data-efficient single calibrator)
         import numpy as np
-        predicted = np.array([r.p_home for r in rows], dtype=np.float64)
-        actual = np.array([1.0 if r.actual_outcome == "HOME" else 0.0 for r in rows], dtype=np.float64)
-        calibrator.fit(predicted, actual)
+        p_home_arr = np.array([r.p_home for r in rows], dtype=np.float64)
+        p_draw_arr = np.array([r.p_draw for r in rows], dtype=np.float64)
+        p_away_arr = np.array([r.p_away for r in rows], dtype=np.float64)
+        outcomes = np.array([r.actual_outcome for r in rows])
+
+        calibrator.fit(p_home_arr, p_draw_arr, p_away_arr, outcomes)
         self._calibrator = calibrator
         return calibrator
 
@@ -240,7 +225,7 @@ class PredictionService:
         self,
         p_home: float, p_draw: float, p_away: float,
     ) -> tuple[float, float, float]:
-        """Calibrate 1X2 probabilities using Platt scaling and re-normalise.
+        """Calibrate 1X2 probabilities using per-class Platt scaling.
 
         Returns calibrated (home, draw, away) that sum to 1.0.
         If calibrator is not fitted the raw probabilities are returned unchanged.
@@ -249,47 +234,22 @@ class PredictionService:
         if not cal.is_fitted:
             return p_home, p_draw, p_away
 
-        # Calibrate each leg independently
-        c_home = cal.transform(p_home)
-        c_draw = cal.transform(p_draw)
-        c_away = cal.transform(p_away)
-
-        # Re-normalise to sum to 1.0
-        total = c_home + c_draw + c_away
-        if total <= 0:
-            return p_home, p_draw, p_away
-
-        c_home /= total
-        c_draw /= total
-        c_away /= total
+        c_home, c_draw, c_away = cal.calibrate_1x2(p_home, p_draw, p_away)
 
         logger.debug(
             "Calibrated 1X2: (%.4f,%.4f,%.4f) → (%.4f,%.4f,%.4f)",
             p_home, p_draw, p_away, c_home, c_draw, c_away,
         )
-        return round(c_home, 6), round(c_draw, 6), round(c_away, 6)
+        return c_home, c_draw, c_away
 
     def _load_xg_map(self, match_ids: list[int]) -> dict[int, dict[int, float]]:
-        """Load xG values from match_stats for given match IDs.
+        """Load xG values from match_stats for given match IDs."""
+        from app.services.prediction.training_data import load_xg_map
+        return load_xg_map(self.db, match_ids)
 
-        Returns ``{match_id: {team_id: xg}}``.
-        """
-        if not match_ids:
-            return {}
-        result: dict[int, dict[int, float]] = {}
-        batch_size = 500
-        for start in range(0, len(match_ids), batch_size):
-            batch = match_ids[start: start + batch_size]
-            stmt = (
-                select(MatchStats.match_id, MatchStats.team_id, MatchStats.xg)
-                .where(MatchStats.match_id.in_(batch))
-                .where(MatchStats.xg.isnot(None))
-            )
-            for row in self.db.execute(stmt):
-                result.setdefault(row.match_id, {})[row.team_id] = row.xg
-        return result
-
-    def _training_matches(self, league_id: int, exclude_id: int) -> list[Match]:
+    def _training_matches(
+        self, league_id: int, exclude_id: int, before_date: datetime | None = None,
+    ) -> list[Match]:
         stmt = (
             select(Match)
             .where(Match.league_id == league_id)
@@ -300,6 +260,8 @@ class PredictionService:
             .order_by(Match.utc_date.asc())
             .options(noload("*"))
         )
+        if before_date is not None:
+            stmt = stmt.where(Match.utc_date < before_date)
         return list(self.db.scalars(stmt).all())
 
     def invalidate_stale_predictions(self) -> int:
@@ -356,35 +318,30 @@ class PredictionService:
         return count
 
     @staticmethod
-    def _to_dict(pred, match: Match) -> dict:
-        d = {
-            "match_id": match.id,
-            "home_team": match.home_team.name if match.home_team else "?",
-            "away_team": match.away_team.name if match.away_team else "?",
-            "home_team_id": match.home_team_id,
-            "away_team_id": match.away_team_id,
-            "league": match.league.name if match.league else "?",
-            "utc_date": match.utc_date,
-            "status": match.status,
-            "p_home": pred.p_home,
-            "p_draw": pred.p_draw,
-            "p_away": pred.p_away,
-            "p_over_1_5": pred.p_over_1_5,
-            "p_under_1_5": pred.p_under_1_5,
-            "p_over_2_5": pred.p_over_2_5,
-            "p_under_2_5": pred.p_under_2_5,
-            "p_over_3_5": pred.p_over_3_5,
-            "p_under_3_5": pred.p_under_3_5,
-            "p_btts_yes": pred.p_btts_yes,
-            "p_btts_no": pred.p_btts_no,
-            "xg_home": pred.xg_home,
-            "xg_away": pred.xg_away,
-            "top_scorelines": pred.top_scorelines,
-            "model": MODEL_NAME,
-            "data_quality": pred.data_quality,
-            # Double chance — derived from 1X2
-            "p_1x": round(pred.p_home + pred.p_draw, 4),
-            "p_x2": round(pred.p_draw + pred.p_away, 4),
-            "p_12": round(pred.p_home + pred.p_away, 4),
-        }
-        return d
+    def _to_result(pred, match: Match) -> MatchPredictionResult:
+        return MatchPredictionResult(
+            match_id=match.id,
+            home_team=match.home_team.name if match.home_team else "?",
+            away_team=match.away_team.name if match.away_team else "?",
+            home_team_id=match.home_team_id,
+            away_team_id=match.away_team_id,
+            league=match.league.name if match.league else "?",
+            utc_date=match.utc_date,
+            status=match.status,
+            p_home=pred.p_home,
+            p_draw=pred.p_draw,
+            p_away=pred.p_away,
+            p_over_1_5=pred.p_over_1_5,
+            p_under_1_5=pred.p_under_1_5,
+            p_over_2_5=pred.p_over_2_5,
+            p_under_2_5=pred.p_under_2_5,
+            p_over_3_5=pred.p_over_3_5,
+            p_under_3_5=pred.p_under_3_5,
+            p_btts_yes=pred.p_btts_yes,
+            p_btts_no=pred.p_btts_no,
+            xg_home=pred.xg_home,
+            xg_away=pred.xg_away,
+            top_scorelines=pred.top_scorelines,
+            model=MODEL_NAME,
+            data_quality=pred.data_quality,
+        )

@@ -12,6 +12,8 @@ if DATABASE_URL is None:
 
 engine = create_engine(
     DATABASE_URL,
+    pool_size=20,
+    max_overflow=10,
     pool_pre_ping=True,
 )
 

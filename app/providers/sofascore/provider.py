@@ -103,6 +103,31 @@ class SofaScoreProvider(BaseProvider):
             })
         return result
 
+    def get_events_for_date(self, target_date: date) -> list[dict]:
+        """Return finished football events for a specific date.
+
+        Uses the date-based endpoint which works across ALL leagues
+        without requiring tournament/season IDs.
+        """
+        try:
+            data = self.client.get_events_by_date(target_date)
+        except Exception:
+            logger.exception("SofaScore: error fetching events for %s", target_date)
+            return []
+
+        events = data.get("events", [])
+        result = []
+        for event in events:
+            status_type = event.get("status", {}).get("type", "")
+            if status_type != "finished":
+                continue
+            result.append({
+                "id": str(event["id"]),
+                "home_team": event.get("homeTeam", {}).get("name", ""),
+                "away_team": event.get("awayTeam", {}).get("name", ""),
+            })
+        return result
+
     # ── Métodos de partidos — no soportados como foco ───────────
 
     def get_fixtures(

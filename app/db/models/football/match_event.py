@@ -1,4 +1,4 @@
-from sqlalchemy import String, Integer, DateTime, ForeignKey, func, Index
+from sqlalchemy import String, Integer, DateTime, ForeignKey, func, Index, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -38,5 +38,9 @@ class MatchEvent(Base):
     team = relationship("Team", lazy="joined")
 
     __table_args__ = (
+        UniqueConstraint(
+            "match_id", "minute", "team_id", "event_type", "player_name",
+            name="uq_match_events_dedup",
+        ),
         Index("ix_match_events_match_minute", "match_id", "minute"),
     )

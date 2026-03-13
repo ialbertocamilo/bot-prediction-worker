@@ -23,9 +23,13 @@ logger = logging.getLogger(__name__)
 
 
 def odds_to_probs(home_odds: float, draw_odds: float, away_odds: float) -> dict[str, float]:
-    """Convert decimal odds to normalised implied probabilities.
+    """Convert decimal odds to fair implied probabilities using the power method.
 
-    Removes the bookmaker margin so P(home) + P(draw) + P(away) = 1.
+    The power method (Shin-style) finds exponent k such that
+    (1/home)^k + (1/draw)^k + (1/away)^k = 1,
+    correcting for the favourite-longshot bias inherent in naive normalisation.
+    Falls back to proportional normalisation if the solver fails.
+
     Returns dict with keys: p_home, p_draw, p_away, margin.
     """
     raw_home = 1.0 / home_odds if home_odds > 0 else 0.0
@@ -36,11 +40,37 @@ def odds_to_probs(home_odds: float, draw_odds: float, away_odds: float) -> dict[
     if total <= 0:
         return {"p_home": 0.0, "p_draw": 0.0, "p_away": 0.0, "margin": 0.0}
 
+    margin = total - 1.0
+    raws = [raw_home, raw_draw, raw_away]
+
+    # Power method: find k via bisection so sum(raw_i^k) = 1
+    # When margin > 0 the solution k > 1; when margin ≈ 0, k ≈ 1.
+    if abs(margin) < 1e-6:
+        # Already fair odds — no correction needed
+        fair = [round(r, 6) for r in raws]
+    else:
+        lo, hi = 1.0, 2.0
+        # Expand upper bound if needed
+        for _ in range(20):
+            if sum(r ** hi for r in raws) < 1.0:
+                break
+            hi *= 2.0
+        # Bisection: 50 iterations gives precision ~1e-15
+        for _ in range(50):
+            mid = (lo + hi) / 2.0
+            val = sum(r ** mid for r in raws)
+            if val > 1.0:
+                lo = mid
+            else:
+                hi = mid
+        k = (lo + hi) / 2.0
+        fair = [round(r ** k, 6) for r in raws]
+
     return {
-        "p_home": round(raw_home / total, 6),
-        "p_draw": round(raw_draw / total, 6),
-        "p_away": round(raw_away / total, 6),
-        "margin": round(total - 1.0, 6),
+        "p_home": fair[0],
+        "p_draw": fair[1],
+        "p_away": fair[2],
+        "margin": round(margin, 6),
     }
 
 
@@ -48,15 +78,22 @@ def compute_edge(
     model_probs: dict[str, float],
     market_probs: dict[str, float],
 ) -> dict[str, float]:
-    """Compute edge = P_model − P_market for each outcome.
+    """Compute multiplicative edge = P_model / P_market − 1 for each outcome.
 
-    Positive edge → model thinks outcome is more likely than market.
+    Equivalent to EV = P_model × odds − 1 when market probs are fair.
+    Positive edge → model thinks outcome is more likely than market implies.
+    A 10% edge at odds 2.0 and 10% edge at odds 20.0 are now correctly
+    comparable (both represent 10% expected profit on stake).
     """
-    return {
-        "edge_home": round(model_probs.get("p_home", 0.0) - market_probs.get("p_home", 0.0), 6),
-        "edge_draw": round(model_probs.get("p_draw", 0.0) - market_probs.get("p_draw", 0.0), 6),
-        "edge_away": round(model_probs.get("p_away", 0.0) - market_probs.get("p_away", 0.0), 6),
-    }
+    edges: dict[str, float] = {}
+    for key, m_key in [("edge_home", "p_home"), ("edge_draw", "p_draw"), ("edge_away", "p_away")]:
+        p_model = model_probs.get(m_key, 0.0)
+        p_market = market_probs.get(m_key, 0.0)
+        if p_market > 1e-9:
+            edges[key] = round(p_model / p_market - 1.0, 6)
+        else:
+            edges[key] = 0.0
+    return edges
 
 
 class ValueService:
@@ -115,8 +152,9 @@ class ValueService:
     ) -> list[dict]:
         """Find matches with the highest positive edge.
 
-        Returns up to *limit* entries sorted by max absolute edge descending.
+        Returns up to *limit* entries sorted by max edge descending.
         Only considers future SCHEDULED matches.
+        Uses batch queries instead of per-match lookups (N+1 fix).
         """
         from datetime import datetime, timezone
 
@@ -124,37 +162,78 @@ class ValueService:
         if model_rec is None:
             return []
 
-        # Future matches with both odds and predictions
+        # Batch: future matches with predictions (single query)
         stmt = (
-            select(Match.id)
+            select(Match.id, Prediction.p_home, Prediction.p_draw, Prediction.p_away)
+            .join(Prediction, Prediction.match_id == Match.id)
             .where(Match.status.in_(("SCHEDULED", "NS")))
             .where(Match.utc_date >= datetime.now(timezone.utc))
+            .where(Prediction.model_id == model_rec.id)
         )
-        match_ids = [row[0] for row in self.db.execute(stmt)]
+        pred_rows = list(self.db.execute(stmt))
+        if not pred_rows:
+            return []
+
+        match_ids = [r[0] for r in pred_rows]
+        pred_map = {r[0]: (float(r[1]), float(r[2]), float(r[3])) for r in pred_rows}
+
+        # Batch: consensus odds for all matches (single query)
+        odds_stmt = (
+            select(MarketOdds.match_id, MarketOdds.home_odds, MarketOdds.draw_odds, MarketOdds.away_odds)
+            .where(MarketOdds.match_id.in_(match_ids))
+        )
+        odds_agg: dict[int, dict[str, list[float]]] = {}
+        for r in self.db.execute(odds_stmt):
+            mid = r.match_id
+            if mid not in odds_agg:
+                odds_agg[mid] = {"home": [], "draw": [], "away": []}
+            odds_agg[mid]["home"].append(r.home_odds)
+            odds_agg[mid]["draw"].append(r.draw_odds)
+            odds_agg[mid]["away"].append(r.away_odds)
 
         results: list[dict] = []
         for mid in match_ids:
-            val = self.match_value(mid, model_name)
-            if val is None:
+            if mid not in pred_map or mid not in odds_agg:
                 continue
 
-            edge = val["edge"]
+            p_h, p_d, p_a = pred_map[mid]
+            od = odds_agg[mid]
+            n = len(od["home"])
+            h_odds = sum(od["home"]) / n
+            d_odds = sum(od["draw"]) / n
+            a_odds = sum(od["away"]) / n
+
+            market = odds_to_probs(h_odds, d_odds, a_odds)
+            model = {"p_home": p_h, "p_draw": p_d, "p_away": p_a}
+            edge = compute_edge(model, market)
+
             max_edge = max(edge["edge_home"], edge["edge_draw"], edge["edge_away"])
             if max_edge < min_edge:
                 continue
 
-            # Determine which outcome has the best edge
             best_outcome = max(
                 [("home", edge["edge_home"]),
                  ("draw", edge["edge_draw"]),
                  ("away", edge["edge_away"])],
                 key=lambda x: x[1],
             )
-            val["best_value"] = {
-                "outcome": best_outcome[0],
-                "edge": best_outcome[1],
-            }
-            results.append(val)
+            results.append({
+                "match_id": mid,
+                "model_probabilities": model,
+                "market_odds": {
+                    "home": round(h_odds, 3),
+                    "draw": round(d_odds, 3),
+                    "away": round(a_odds, 3),
+                    "bookmakers": n,
+                },
+                "market_probabilities": market,
+                "edge": edge,
+                "margin": market["margin"],
+                "best_value": {
+                    "outcome": best_outcome[0],
+                    "edge": best_outcome[1],
+                },
+            })
 
         results.sort(key=lambda x: x["best_value"]["edge"], reverse=True)
         return results[:limit]

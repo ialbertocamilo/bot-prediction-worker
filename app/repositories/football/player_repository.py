@@ -57,13 +57,19 @@ class PlayerRepository:
         self.db.refresh(player)
         return player
 
+    _UPDATABLE_FIELDS: frozenset[str] = frozenset({
+        "date_of_birth", "nationality", "position", "height_cm",
+        "weight_kg", "foot", "team_id", "jersey_number",
+        "market_value_eur", "contract_until",
+    })
+
     def update(
         self,
         player: Player,
         **kwargs: object,
     ) -> Player:
         for key, value in kwargs.items():
-            if hasattr(player, key):
+            if key in self._UPDATABLE_FIELDS and value is not None:
                 setattr(player, key, value)
         self.db.flush()
         self.db.refresh(player)

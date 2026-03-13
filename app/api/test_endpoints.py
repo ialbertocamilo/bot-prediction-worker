@@ -14,15 +14,17 @@ They call existing services as-is and return results as JSON.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
-from app.db.session import SessionLocal
+from app.api.dependencies import get_db
 from app.services.canonical_league_service import CanonicalLeagueService
 from app.services.prediction.backtesting_service import BacktestingService
 from app.services.prediction.hyperparameter_optimization_service import (
@@ -34,14 +36,6 @@ from app.services.prediction.rolling_retrain_service import RollingRetrainServic
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
-
-
-def _get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
 
 
 # ── Request schemas (for POST endpoints) ─────────────────────────────────
@@ -58,20 +52,74 @@ class RollingRetrainRequest(BaseModel):
 
 
 class OptimizeRequest(BaseModel):
-    mode: Literal["coarse", "fine", "full"] = Field("coarse", description="Grid search mode")
+    mode: Literal["coarse", "fine", "full", "random"] = Field("coarse", description="Search mode")
     league_id: int = Field(..., description="League ID")
+    n_iter: int = Field(30, ge=1, le=500, description="Max random combos (only for 'random' mode)")
 
 
-# ── Shared state for match listing ────────────────────────────────────────
+# ── League-keyed match cache (stateless-friendly) ────────────────────────
 
-_upcoming_cache: list[dict] = []
-_upcoming_match_ids: list[int] = []
+import time as _time
+
+_MATCH_CACHE_TTL = 300  # 5 minutes
+
+
+class _MatchCache:
+    """League-keyed cache with lazy asyncio.Lock (avoids module-level deadlock).
+
+    Each entry is keyed by canonical league index (None = all leagues) and
+    stores {match_number → match_id} for fast lookup, plus a TTL timestamp.
+    """
+
+    def __init__(self) -> None:
+        self._lock: asyncio.Lock | None = None
+        self._store: dict[int | None, tuple[float, dict[int, int]]] = {}
+
+    def _get_lock(self) -> asyncio.Lock:
+        """Lazily create the lock inside the running event loop."""
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
+
+    async def update(
+        self, league_key: int | None, number_to_id: dict[int, int],
+    ) -> None:
+        async with self._get_lock():
+            self._store[league_key] = (_time.monotonic(), dict(number_to_id))
+
+    async def get_match_id(
+        self, league_key: int | None, match_number: int,
+    ) -> int | None:
+        """Return match_id for 1-based match_number within a league listing."""
+        async with self._get_lock():
+            entry = self._store.get(league_key)
+            if entry is None:
+                return None
+            ts, mapping = entry
+            if _time.monotonic() - ts > _MATCH_CACHE_TTL:
+                self._store.pop(league_key, None)
+                return None
+            return mapping.get(match_number)
+
+    async def get_size(self, league_key: int | None) -> int:
+        async with self._get_lock():
+            entry = self._store.get(league_key)
+            if entry is None:
+                return 0
+            ts, mapping = entry
+            if _time.monotonic() - ts > _MATCH_CACHE_TTL:
+                self._store.pop(league_key, None)
+                return 0
+            return len(mapping)
+
+
+_match_cache = _MatchCache()
 
 
 # ── GET /leagues ──────────────────────────────────────────────────────────
 
 @router.get("/leagues")
-def list_leagues(db: Session = Depends(_get_db)):
+def list_leagues(db: Session = Depends(get_db)):
     """Return canonical (deduplicated) leagues with match counts."""
     svc = CanonicalLeagueService(db)
     leagues = svc.list_leagues()
@@ -99,29 +147,30 @@ def list_leagues(db: Session = Depends(_get_db)):
 # ── GET /matches ──────────────────────────────────────────────────────────
 
 @router.get("/matches")
-def list_matches(
+async def list_matches(
     league: int | None = Query(None, description="Canonical league index (from /leagues)"),
-    db: Session = Depends(_get_db),
-):
+    db: Session = Depends(get_db),
+) -> dict:
     """Return upcoming scheduled matches (deduplicated across providers)."""
-    global _upcoming_cache, _upcoming_match_ids
-
     svc = CanonicalLeagueService(db)
 
-    # Auto-ingest if the selected canonical league has no matches
+    # ── Validation (pure CPU — no threadpool needed) ──
     if league is not None:
-        all_leagues = svc.list_leagues()
+        all_leagues = await run_in_threadpool(svc.list_leagues)
         if league < 1 or league > len(all_leagues):
             raise HTTPException(
                 status_code=400,
                 detail=f"league out of range. Valid: 1-{len(all_leagues)}",
             )
-        svc.auto_ingest_if_empty(league)
+        await run_in_threadpool(svc.auto_ingest_if_empty, league)
 
-    upcoming = svc.get_upcoming(canonical_index=league)
+    # ── Blocking I/O: only the DB query goes into the threadpool ──
+    upcoming = await run_in_threadpool(svc.get_upcoming, canonical_index=league)
 
-    items = []
-    match_ids = []
+    # ── Response construction (pure CPU) ──
+    items: list[dict] = []
+    number_to_id: dict[int, int] = {}
+
     for idx, m in enumerate(upcoming[:30], 1):
         items.append({
             "number": idx,
@@ -133,10 +182,10 @@ def list_matches(
             "utc_date": m.utc_date.isoformat() if m.utc_date else None,
             "round": m.round,
         })
-        match_ids.append(m.id)
+        number_to_id[idx] = m.id
 
-    _upcoming_cache = items
-    _upcoming_match_ids = match_ids
+    # Cache keyed by league index — avoids cross-user overwrites
+    await _match_cache.update(league, number_to_id)
 
     return {"count": len(items), "league": league, "matches": items}
 
@@ -144,45 +193,59 @@ def list_matches(
 # ── GET /predict ──────────────────────────────────────────────────────────
 
 @router.get("/predict")
-def predict_match(
-    match_number: int = Query(..., ge=1, description="Number from /matches listing"),
-    db: Session = Depends(_get_db),
-):
-    """Predict a match by its number from the /matches listing."""
-    if not _upcoming_match_ids:
+async def predict_match(
+    match_id: int | None = Query(None, ge=1, description="Direct match ID (preferred, stateless)"),
+    match_number: int | None = Query(None, ge=1, description="Number from /matches listing (legacy)"),
+    league: int | None = Query(None, description="League index used in /matches (for cache lookup)"),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Predict a match.
+
+    Preferred (stateless): ``/predict?match_id=42``
+    Legacy shortcut:       ``/predict?match_number=3&league=1``
+    """
+    if match_id is None and match_number is None:
         raise HTTPException(
             status_code=400,
-            detail="No match listing available. Call GET /matches first.",
-        )
-    if match_number > len(_upcoming_match_ids):
-        raise HTTPException(
-            status_code=400,
-            detail=f"match_number out of range. Valid: 1-{len(_upcoming_match_ids)}",
+            detail="Provide match_id (preferred) or match_number + league.",
         )
 
-    match_id = _upcoming_match_ids[match_number - 1]
-    service = PredictionService(db)
-    result = service.predict_match(match_id)
+    # Resolve match_id from cache if only match_number was given
+    if match_id is None:
+        cache_size = await _match_cache.get_size(league)
+        if cache_size == 0:
+            raise HTTPException(
+                status_code=400,
+                detail="No cached listing for this league. Call GET /matches?league=N first, or use match_id directly.",
+            )
+        match_id = await _match_cache.get_match_id(league, match_number)  # type: ignore[arg-type]
+        if match_id is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"match_number out of range. Valid: 1-{cache_size}",
+            )
+
+    result = await run_in_threadpool(PredictionService(db).predict_match, match_id)
     if result is None:
         raise HTTPException(
             status_code=404,
             detail="Could not generate prediction. Insufficient historical data.",
         )
 
-    # Sanitize non-serializable fields
-    if result.get("utc_date"):
-        result["utc_date"] = result["utc_date"].isoformat()
+    response = result.to_dict()
+    if response.get("utc_date"):
+        response["utc_date"] = response["utc_date"].isoformat()
 
-    return {"match_number": match_number, "match_id": match_id, "prediction": result}
+    return {"match_id": match_id, "prediction": response}
 
 
 # ── POST /backtest ────────────────────────────────────────────────────────
 
 @router.post("/backtest")
-def run_backtest(req: BacktestRequest, db: Session = Depends(_get_db)):
+async def run_backtest(req: BacktestRequest, db: Session = Depends(get_db)):
     """Run walk-forward backtesting (read-only, no persistence)."""
     svc = BacktestingService(db, league_id=req.league_id)
-    report = svc.run()
+    report = await run_in_threadpool(svc.run)
 
     if report.total_matches == 0:
         raise HTTPException(
@@ -208,7 +271,7 @@ def run_backtest(req: BacktestRequest, db: Session = Depends(_get_db)):
 # ── POST /rolling_retrain ────────────────────────────────────────────────
 
 @router.post("/rolling_retrain")
-def run_rolling_retrain(req: RollingRetrainRequest, db: Session = Depends(_get_db)):
+async def run_rolling_retrain(req: RollingRetrainRequest, db: Session = Depends(get_db)):
     """Run rolling retraining. Defaults to dry_run=true for safety."""
     from_dt = None
     if req.from_date:
@@ -225,7 +288,7 @@ def run_rolling_retrain(req: RollingRetrainRequest, db: Session = Depends(_get_d
         from_date=from_dt,
         dry_run=req.dry_run,
     )
-    report = svc.run()
+    report = await run_in_threadpool(svc.run)
 
     # Invalidate cached predictions after actual retrain
     invalidated = 0
@@ -249,16 +312,20 @@ def run_rolling_retrain(req: RollingRetrainRequest, db: Session = Depends(_get_d
 # ── POST /optimize_model ─────────────────────────────────────────────────
 
 @router.post("/optimize_model")
-def run_optimize(req: OptimizeRequest, db: Session = Depends(_get_db)):
-    """Run hyperparameter grid search. Can be slow for 'full' mode."""
+async def run_optimize(req: OptimizeRequest, db: Session = Depends(get_db)):
+    """Run hyperparameter search. Modes: coarse, fine, full, random."""
     svc = HyperparameterOptimizationService(db=db, league_id=req.league_id)
 
-    if req.mode == "coarse":
-        report = svc.run_coarse()
-    elif req.mode == "fine":
-        report = svc.run_fine()
-    else:
-        report = svc.run()
+    def _run_search():
+        if req.mode == "coarse":
+            return svc.run_coarse()
+        elif req.mode == "fine":
+            return svc.run_fine()
+        elif req.mode == "random":
+            return svc.run_random(n_iter=req.n_iter)
+        return svc.run()
+
+    report = await run_in_threadpool(_run_search)
 
     best = report.best
     ranked = report.ranked[:10]
@@ -271,7 +338,8 @@ def run_optimize(req: OptimizeRequest, db: Session = Depends(_get_db)):
         "league_id": req.league_id,
         "mode": req.mode,
         "total_combos": report.total_combos,
-        "evaluated": len(report.results),
+        "evaluated": report.evaluated,
+        "pruned": report.pruned,
         "total_elapsed_secs": round(report.total_elapsed_secs, 1),
         "best": {
             "time_decay": best.time_decay,
@@ -307,7 +375,7 @@ class SeedRequest(BaseModel):
 
 
 @router.post("/seed_leagues")
-def seed_leagues(req: SeedRequest, db: Session = Depends(_get_db)):
+def seed_leagues(req: SeedRequest, db: Session = Depends(get_db)):
     """Ingest results + fixtures for configured leagues from ESPN."""
     svc = CanonicalLeagueService(db)
 

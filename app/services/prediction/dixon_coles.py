@@ -19,11 +19,13 @@ import numpy as np
 from scipy.optimize import minimize
 from scipy.stats import poisson as poisson_dist
 
-from config import HOME_ADVANTAGE
-
 logger = logging.getLogger(__name__)
 
 MAX_GOALS = 12
+
+# Sensible default for home advantage initial value (Dixon & Coles 1997).
+# Callers should override via constructor parameter.
+_DEFAULT_HOME_ADV_INIT = 0.25
 
 @dataclass(frozen=True)
 class MatchData:
@@ -111,7 +113,7 @@ def _neg_log_likelihood(
 class DixonColesModel:
     def __init__(self, time_decay: float = 0.005, home_adv_init: float | None = None) -> None:
         self.time_decay = time_decay
-        self.home_adv_init = home_adv_init if home_adv_init is not None else HOME_ADVANTAGE
+        self.home_adv_init = home_adv_init if home_adv_init is not None else _DEFAULT_HOME_ADV_INIT
         self.params: DixonColesParams | None = None
 
     def fit(
@@ -179,7 +181,7 @@ class DixonColesModel:
                   xg_att_prior, xg_def_prior, xg_mask, eff_xg_weight),
             method="L-BFGS-B",
             bounds=bounds,
-            options={"maxiter": 500, "ftol": 1e-8},
+            options={"maxiter": 2000, "maxfun": 30000, "ftol": 1e-8},
         )
 
         if not res.success:

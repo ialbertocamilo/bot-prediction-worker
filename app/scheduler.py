@@ -96,7 +96,8 @@ def _run_retrain_pipeline() -> None:
             logger.info("Retrain completado: %s", retrain_report.summary()[:200])
         except Exception:
             db.rollback()
-            logger.exception("Scheduler: error en rolling retrain")
+            logger.exception("Scheduler: error en rolling retrain — abortando pipeline")
+            return
         finally:
             db.close()
 
@@ -107,7 +108,7 @@ def _run_retrain_pipeline() -> None:
             bt_report = bt_svc.run()
             logger.info("Backtest completado: %s", bt_report.summary()[:200])
         except Exception:
-            logger.exception("Scheduler: error en backtest")
+            logger.exception("Scheduler: error en backtest — continuando con invalidación")
         finally:
             db.close()
 
@@ -134,33 +135,40 @@ def _run_backfill_pipeline() -> None:
     """Backfill historical stats for matches that lack them + purge old raw records."""
     from app.worker_main import backfill_stats
 
-    logger.info("⏰ Scheduler: iniciando backfill de stats")
-    try:
-        backfill_stats()
-    except Exception:
-        logger.exception("Scheduler: error en backfill_stats")
+    if not _pipeline_lock.acquire(blocking=False):
+        logger.warning("Scheduler: backfill pipeline skipped — another pipeline is running")
+        return
 
-    # Purge raw_records older than 90 days to prevent unbounded table growth
     try:
-        from app.db.session import SessionLocal
-        from app.repositories.core.raw_record_repository import RawRecordRepository
-
-        db = SessionLocal()
+        logger.info("⏰ Scheduler: iniciando backfill de stats")
         try:
-            repo = RawRecordRepository(db)
-            purged = repo.purge_older_than(days=90)
-            db.commit()
-            if purged:
-                logger.info("Purged %d raw_records older than 90 days", purged)
+            backfill_stats()
         except Exception:
-            db.rollback()
-            logger.exception("Scheduler: error purging raw_records")
-        finally:
-            db.close()
-    except Exception:
-        logger.exception("Scheduler: error in raw_records purge setup")
+            logger.exception("Scheduler: error en backfill_stats")
 
-    logger.info("✅ Scheduler: backfill completado")
+        # Purge raw_records older than 90 days to prevent unbounded table growth
+        try:
+            from app.db.session import SessionLocal
+            from app.repositories.core.raw_record_repository import RawRecordRepository
+
+            db = SessionLocal()
+            try:
+                repo = RawRecordRepository(db)
+                purged = repo.purge_older_than(days=90)
+                db.commit()
+                if purged:
+                    logger.info("Purged %d raw_records older than 90 days", purged)
+            except Exception:
+                db.rollback()
+                logger.exception("Scheduler: error purging raw_records")
+            finally:
+                db.close()
+        except Exception:
+            logger.exception("Scheduler: error in raw_records purge setup")
+
+        logger.info("✅ Scheduler: backfill completado")
+    finally:
+        _pipeline_lock.release()
 
 
 # ── lifecycle ─────────────────────────────────────────────────────────────

@@ -186,55 +186,116 @@ def sync_match_stats() -> None:
             away_name = m.away_team.name if m.away_team else "Unknown"
             pending[m.id] = (home_name, away_name)
 
-        # 3) Iterate provider finished events with extended pagination
-        max_pages = int(os.getenv("STATS_MAX_PAGES", "40"))
-        page, ingested = 0, 0
+        # 3) Group matches by date → query SofaScore date-based endpoint
+        from collections import defaultdict
 
-        while page < max_pages and pending:
-            finished_events = stats_provider.get_finished_events_page(page=page)
-            if not finished_events:
-                break
+        matches_by_date: dict[date, list[int]] = defaultdict(list)
+        match_dates: dict[int, date] = {}
+        for m in needing_stats:
+            if m.utc_date:
+                d = m.utc_date.date() if hasattr(m.utc_date, 'date') else m.utc_date
+                matches_by_date[d].append(m.id)
+                match_dates[m.id] = d
 
-            for event in finished_events:
+        unique_dates = sorted(matches_by_date.keys(), reverse=True)
+        logger.info("Stats sync: %d unique dates to query", len(unique_dates))
+
+        ingested = 0
+        has_get_events_for_date = hasattr(stats_provider, 'get_events_for_date')
+
+        if has_get_events_for_date:
+            # Date-based lookup (works for ALL leagues, no tournament/season ID needed)
+            for target_date in unique_dates:
                 if not pending:
                     break
 
-                event_id = event["id"]
-                sc_home = event.get("home_team", "")
-                sc_away = event.get("away_team", "")
+                finished_events = stats_provider.get_events_for_date(target_date)
+                if not finished_events:
+                    continue
 
-                # Find matching DB match
-                matched_id: int | None = None
-                for mid, (db_home, db_away) in pending.items():
-                    if _match_team_name(sc_home, db_home) and _match_team_name(sc_away, db_away):
-                        matched_id = mid
+                for event in finished_events:
+                    if not pending:
                         break
 
-                if matched_id is None:
-                    continue
+                    event_id = event["id"]
+                    sc_home = event.get("home_team", "")
+                    sc_away = event.get("away_team", "")
 
-                # Fetch stats from provider
-                stats_list = stats_provider.get_match_stats(event_id)
-                if not stats_list:
+                    matched_id: int | None = None
+                    for mid in matches_by_date[target_date]:
+                        if mid not in pending:
+                            continue
+                        db_home, db_away = pending[mid]
+                        if _match_team_name(sc_home, db_home) and _match_team_name(sc_away, db_away):
+                            matched_id = mid
+                            break
+
+                    if matched_id is None:
+                        continue
+
+                    try:
+                        stats_list = stats_provider.get_match_stats(event_id)
+                    except Exception:
+                        logger.warning("Stats fetch failed for event %s, skipping", event_id)
+                        pending.pop(matched_id, None)
+                        continue
+                    if not stats_list:
+                        pending.pop(matched_id, None)
+                        continue
+
+                    ids = stats_svc.ingest_match_stats(
+                        stats_list,
+                        source_match_id_to_db_id={event_id: matched_id},
+                    )
+                    ingested += len(ids)
                     pending.pop(matched_id, None)
-                    continue
 
-                # Ingest with direct id mapping
-                ids = stats_svc.ingest_match_stats(
-                    stats_list,
-                    source_match_id_to_db_id={event_id: matched_id},
-                )
-                ingested += len(ids)
-                pending.pop(matched_id, None)
+                    logger.info(
+                        "Stats event %s → match %d (%s vs %s): %d registros",
+                        event_id, matched_id, sc_home, sc_away, len(ids),
+                    )
 
-                logger.info(
-                    "Stats event %s → match %d (%s vs %s): %d registros",
-                    event_id, matched_id, sc_home, sc_away, len(ids),
-                )
-
-            if len(finished_events) < 20:
-                break
-            page += 1
+                    # Commit every 50 matches so progress isn't lost
+                    if ingested % 50 < 3:
+                        db.commit()
+        else:
+            # Fallback: tournament-based pagination (legacy)
+            max_pages = int(os.getenv("STATS_MAX_PAGES", "40"))
+            page = 0
+            while page < max_pages and pending:
+                finished_events = stats_provider.get_finished_events_page(page=page)
+                if not finished_events:
+                    break
+                for event in finished_events:
+                    if not pending:
+                        break
+                    event_id = event["id"]
+                    sc_home = event.get("home_team", "")
+                    sc_away = event.get("away_team", "")
+                    matched_id = None
+                    for mid, (db_home, db_away) in pending.items():
+                        if _match_team_name(sc_home, db_home) and _match_team_name(sc_away, db_away):
+                            matched_id = mid
+                            break
+                    if matched_id is None:
+                        continue
+                    stats_list = stats_provider.get_match_stats(event_id)
+                    if not stats_list:
+                        pending.pop(matched_id, None)
+                        continue
+                    ids = stats_svc.ingest_match_stats(
+                        stats_list,
+                        source_match_id_to_db_id={event_id: matched_id},
+                    )
+                    ingested += len(ids)
+                    pending.pop(matched_id, None)
+                    logger.info(
+                        "Stats event %s → match %d (%s vs %s): %d registros",
+                        event_id, matched_id, sc_home, sc_away, len(ids),
+                    )
+                if len(finished_events) < 20:
+                    break
+                page += 1
 
         db.commit()
         logger.info("Total stats ingresados: %d registros", ingested)
@@ -270,11 +331,11 @@ def precompute_predictions() -> None:
                     logger.info(
                         "Predicción match %d: %s vs %s  →  H=%.1f%%  D=%.1f%%  A=%.1f%%",
                         match.id,
-                        result["home_team"],
-                        result["away_team"],
-                        result["p_home"] * 100,
-                        result["p_draw"] * 100,
-                        result["p_away"] * 100,
+                        result.home_team,
+                        result.away_team,
+                        result.p_home * 100,
+                        result.p_draw * 100,
+                        result.p_away * 100,
                     )
             except Exception as exc:
                 logger.warning("Error predicción match %d: %s", match.id, exc)

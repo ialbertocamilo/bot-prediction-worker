@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
-from app.db.session import SessionLocal
+from app.api.dependencies import get_db
 from app.repositories.football.match_repository import MatchRepository
 from app.repositories.prediction.market_odds_repository import MarketOddsRepository
 from app.repositories.prediction.model_repository import ModelRepository
@@ -14,14 +14,6 @@ from app.services.prediction.prediction_service import PredictionService
 from app.services.prediction.value_service import ValueService, odds_to_probs, compute_edge
 
 router = APIRouter()
-
-
-def _get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
 
 
 # ── helpers ───────────────────────────────────────────────────────────────
@@ -82,7 +74,7 @@ def _value_analysis(p_home: float, p_draw: float, p_away: float,
 def upcoming(
     league_id: int | None = Query(None, description="Filtrar por liga"),
     days: int = Query(7, ge=1, le=30, description="Días hacia adelante"),
-    db: Session = Depends(_get_db),
+    db: Session = Depends(get_db),
 ):
     """Próximos partidos con predicciones pre-calculadas."""
     now = datetime.now(timezone.utc)
@@ -161,7 +153,7 @@ def predict(
     odds_home: float | None = Query(None, description="Cuota decimal del local"),
     odds_draw: float | None = Query(None, description="Cuota decimal del empate"),
     odds_away: float | None = Query(None, description="Cuota decimal del visitante"),
-    db: Session = Depends(_get_db),
+    db: Session = Depends(get_db),
 ):
     """
     Predicción Dixon-Coles para un partido.
@@ -178,17 +170,20 @@ def predict(
             detail="No se pudo generar predicción. Verifica el ID y que haya datos suficientes.",
         )
 
+    # Serialize to dict for JSON response, then augment with value analysis
+    response = result.to_dict()
+
     # Add fair odds to response
-    result["fair_odds"] = {
-        "home": _fair_odds(result["p_home"]),
-        "draw": _fair_odds(result["p_draw"]),
-        "away": _fair_odds(result["p_away"]),
+    response["fair_odds"] = {
+        "home": _fair_odds(result.p_home),
+        "draw": _fair_odds(result.p_draw),
+        "away": _fair_odds(result.p_away),
     }
 
     # If bookmaker odds provided, add value analysis
     if odds_home is not None and odds_draw is not None and odds_away is not None:
-        result["value_analysis"] = _value_analysis(
-            result["p_home"], result["p_draw"], result["p_away"],
+        response["value_analysis"] = _value_analysis(
+            result.p_home, result.p_draw, result.p_away,
             odds_home, odds_draw, odds_away,
         )
 
@@ -196,22 +191,22 @@ def predict(
     value_svc = ValueService(db)
     stored_value = value_svc.match_value(match_id)
     if stored_value:
-        result["market_odds"] = stored_value["market_odds"]
-        result["market_probabilities"] = stored_value["market_probabilities"]
-        result["edge"] = stored_value["edge"]
+        response["market_odds"] = stored_value["market_odds"]
+        response["market_probabilities"] = stored_value["market_probabilities"]
+        response["edge"] = stored_value["edge"]
     else:
-        result.setdefault("market_odds", None)
-        result.setdefault("market_probabilities", None)
-        result.setdefault("edge", None)
+        response.setdefault("market_odds", None)
+        response.setdefault("market_probabilities", None)
+        response.setdefault("edge", None)
 
-    return result
+    return response
 
 
 @router.get("/value-bets/top")
 def value_bets(
     min_edge: float = Query(0.03, ge=0.0, le=1.0, description="Edge mínimo para filtrar"),
     limit: int = Query(20, ge=1, le=100, description="Máximo de resultados"),
-    db: Session = Depends(_get_db),
+    db: Session = Depends(get_db),
 ):
     """Top value bets: partidos donde el modelo detecta mayor edge vs mercado."""
     svc = ValueService(db)

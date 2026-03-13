@@ -1,14 +1,9 @@
 from __future__ import annotations
 
-from difflib import SequenceMatcher
-
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.db.models.football.team import Team
-
-# Minimum similarity ratio to consider a fuzzy match
-_FUZZY_THRESHOLD = 0.82
 
 
 class TeamRepository:
@@ -35,12 +30,12 @@ class TeamRepository:
         self,
         name: str,
         country: str | None = None,
-        threshold: float = _FUZZY_THRESHOLD,
+        threshold: float = 0.82,
     ) -> Team | None:
-        """Find a team by exact name first, then fuzzy matching.
+        """Find a team by exact name first, then SQL ilike fallback.
 
-        Also checks the short_name column and substring containment.
-        Returns None if no match meets the threshold.
+        Uses database-side pattern matching instead of loading all teams.
+        Returns None if no match is found.
         """
         # 1) Exact match
         exact = self.find_by_name_country(name=name, country=country)
@@ -55,37 +50,20 @@ class TeamRepository:
         if by_short is not None:
             return by_short
 
-        # 3) Fuzzy scan — load all teams once and score in memory
-        all_teams = list(self.db.scalars(select(Team)).all())
-        target = name.lower().strip()
+        # 3) SQL ilike — substring search on name and short_name
+        pattern = f"%{name}%"
+        stmt = select(Team).where(
+            or_(
+                Team.name.ilike(pattern),
+                Team.short_name.ilike(pattern),
+            )
+        )
+        if country is not None:
+            stmt = stmt.where(Team.country == country)
+        stmt = stmt.limit(10)
 
-        best_team: Team | None = None
-        best_ratio: float = 0.0
-
-        for t in all_teams:
-            if country is not None and t.country and t.country != country:
-                continue
-
-            for candidate in (t.name, t.short_name):
-                if candidate is None:
-                    continue
-                cand_lower = candidate.lower().strip()
-
-                # Containment check (e.g. "Barcelona" in "FC Barcelona")
-                # Only apply when the shorter side is at least 4 chars to
-                # avoid false positives with very short names like "AC".
-                shorter = min(len(target), len(cand_lower))
-                if shorter >= 4 and (target in cand_lower or cand_lower in target):
-                    return t
-
-                ratio = SequenceMatcher(None, target, cand_lower).ratio()
-                if ratio > best_ratio:
-                    best_ratio = ratio
-                    best_team = t
-
-        if best_ratio >= threshold:
-            return best_team
-        return None
+        match = self.db.scalar(stmt)
+        return match
 
     def create(
         self,

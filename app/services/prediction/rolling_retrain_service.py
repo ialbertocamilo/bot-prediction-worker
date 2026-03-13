@@ -10,7 +10,6 @@ Compatible with PredictionService and BacktestingService (no modifications).
 from __future__ import annotations
 
 import logging
-import math
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -23,11 +22,12 @@ from app.repositories.prediction.league_hyperparams_repository import LeagueHype
 from app.repositories.prediction.model_repository import ModelRepository
 from app.repositories.prediction.team_rating_repository import TeamRatingRepository
 from app.services.prediction.dixon_coles import DixonColesModel, MatchData
-from config import HOME_ADVANTAGE, TIME_DECAY, XG_REG_WEIGHT
+from app.services.prediction.training_data import build_training_data, load_xg_map
+from config import HOME_ADVANTAGE, TIME_DECAY, XG_REG_WEIGHT, MIN_XG_MATCHES
 
 logger = logging.getLogger(__name__)
 
-MODEL_NAME = "dixon_coles_rolling"
+MODEL_NAME = "dixon_coles_v1"
 MODEL_DESCRIPTION = "Dixon-Coles rolling retrain — snapshot per match"
 MIN_TRAINING = 30
 
@@ -108,7 +108,7 @@ class RollingRetrainService:
         logger.info("Rolling retrain: %d partidos terminados", len(matches))
 
         all_ids = [m.id for m in matches]
-        xg_map = self._load_xg_map(all_ids)
+        xg_map = load_xg_map(self.db, all_ids)
 
         for i, target in enumerate(matches):
             # Optionally skip matches before from_date
@@ -128,48 +128,14 @@ class RollingRetrainService:
                 report.skipped_insufficient += 1
                 continue
 
-            # Build training data with time-decay
             ref_ts = target.utc_date
-            match_data: list[MatchData] = []
-            xg_for_lists: dict[int, list[float]] = {}
-            xg_against_lists: dict[int, list[float]] = {}
-
-            for m in training_pool:
-                if m.home_goals is None or m.away_goals is None:
-                    continue
-                days_ago = 0.0
-                if m.utc_date and ref_ts:
-                    delta = (ref_ts - m.utc_date).total_seconds() / 86400.0
-                    days_ago = max(delta, 0.0)
-                w = math.exp(-time_decay * days_ago)
-
-                match_data.append(MatchData(
-                    home_team_id=m.home_team_id,
-                    away_team_id=m.away_team_id,
-                    home_goals=m.home_goals,
-                    away_goals=m.away_goals,
-                    weight=w,
-                ))
-
-                pair = xg_map.get(m.id, {})
-                h_xg = pair.get(m.home_team_id)
-                a_xg = pair.get(m.away_team_id)
-                if h_xg is not None and a_xg is not None:
-                    xg_for_lists.setdefault(m.home_team_id, []).append(h_xg)
-                    xg_against_lists.setdefault(m.home_team_id, []).append(a_xg)
-                    xg_for_lists.setdefault(m.away_team_id, []).append(a_xg)
-                    xg_against_lists.setdefault(m.away_team_id, []).append(h_xg)
+            match_data, xg_priors = build_training_data(
+                training_pool, ref_ts, time_decay, xg_map, MIN_XG_MATCHES,
+            )
 
             if len(match_data) < MIN_TRAINING:
                 report.skipped_insufficient += 1
                 continue
-
-            # Build xG priors
-            xg_priors: dict[int, tuple[float, float]] = {}
-            for tid in set(xg_for_lists) & set(xg_against_lists):
-                avg_for = sum(xg_for_lists[tid]) / len(xg_for_lists[tid])
-                avg_against = sum(xg_against_lists[tid]) / len(xg_against_lists[tid])
-                xg_priors[tid] = (avg_for, avg_against)
 
             # Fit Dixon-Coles
             dc = DixonColesModel(time_decay=time_decay, home_adv_init=home_advantage)
@@ -240,19 +206,3 @@ class RollingRetrainService:
         if self.league_id is not None:
             stmt = stmt.where(Match.league_id == self.league_id)
         return list(self.db.scalars(stmt).all())
-
-    def _load_xg_map(self, match_ids: list[int]) -> dict[int, dict[int, float]]:
-        if not match_ids:
-            return {}
-        result: dict[int, dict[int, float]] = {}
-        batch_size = 500
-        for start in range(0, len(match_ids), batch_size):
-            batch = match_ids[start: start + batch_size]
-            stmt = (
-                select(MatchStats.match_id, MatchStats.team_id, MatchStats.xg)
-                .where(MatchStats.match_id.in_(batch))
-                .where(MatchStats.xg.isnot(None))
-            )
-            for row in self.db.execute(stmt):
-                result.setdefault(row.match_id, {})[row.team_id] = row.xg
-        return result

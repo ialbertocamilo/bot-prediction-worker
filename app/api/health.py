@@ -4,20 +4,12 @@ from sqlalchemy.orm import Session
 
 from app.db.models.football.match import Match
 from app.db.models.football.match_stats import MatchStats
-from app.db.session import SessionLocal
+from app.api.dependencies import get_db
 from app.providers.cache import get_provider_cache
 from app.providers.rate_limiter import get_all_metrics as get_rate_limiter_metrics
 from app.scheduler import get_scheduler_status
 
 router = APIRouter()
-
-
-def _get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
 
 
 @router.get("")
@@ -26,7 +18,7 @@ def health():
 
 
 @router.get("/metrics")
-def metrics(db: Session = Depends(_get_db)):
+def metrics(db: Session = Depends(get_db)):
     """Observability endpoint: provider metrics, cache, stats coverage."""
     # Stats coverage
     total_finished = db.scalar(

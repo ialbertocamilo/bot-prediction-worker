@@ -73,8 +73,9 @@ class PlattCalibrator:
         targets = actual * t_pos + (1.0 - actual) * t_neg
 
         a, b = 0.0, math.log((n_neg + 1.0) / (n_pos + 1.0))
+        converge_tol = 1e-7
 
-        for _ in range(100):
+        for iteration in range(100):
             f = 1.0 / (1.0 + np.exp(-(a * logits + b)))
             f = np.clip(f, eps, 1.0 - eps)
 
@@ -89,8 +90,14 @@ class PlattCalibrator:
             if abs(det) < 1e-12:
                 break
 
-            a -= (d2b * d1a - d2ab * d1b) / det
-            b -= (d2a * d1b - d2ab * d1a) / det
+            da = (d2b * d1a - d2ab * d1b) / det
+            db = (d2a * d1b - d2ab * d1a) / det
+            a -= da
+            b -= db
+
+            if abs(da) + abs(db) < converge_tol:
+                logger.debug("Platt converged at iteration %d", iteration + 1)
+                break
 
         self._a = float(a)
         self._b = float(b)
@@ -114,3 +121,74 @@ class PlattCalibrator:
         p = np.clip(raw_probs, eps, 1.0 - eps)
         logits = np.log(p / (1.0 - p))
         return 1.0 / (1.0 + np.exp(-(self._a * logits + self._b)))
+
+
+class MultiClassPlattCalibrator:
+    """Three independent Platt calibrators for 1X2 outcomes.
+
+    Each outcome (home / draw / away) gets its own logistic calibration
+    curve, avoiding the bias that occurs when a single calibrator trained
+    on one outcome class is applied to all three.
+    """
+
+    def __init__(self) -> None:
+        self.home = PlattCalibrator()
+        self.draw = PlattCalibrator()
+        self.away = PlattCalibrator()
+
+    @property
+    def is_fitted(self) -> bool:
+        return self.home.is_fitted or self.draw.is_fitted or self.away.is_fitted
+
+    def fit(
+        self,
+        p_home: np.ndarray,
+        p_draw: np.ndarray,
+        p_away: np.ndarray,
+        actual_outcomes: np.ndarray,
+    ) -> None:
+        """Fit three calibrators from historical predictions.
+
+        Args:
+            p_home: Raw home-win probabilities.
+            p_draw: Raw draw probabilities.
+            p_away: Raw away-win probabilities.
+            actual_outcomes: String outcomes ("HOME", "DRAW", "AWAY").
+        """
+        home_actual = np.array([1.0 if o == "HOME" else 0.0 for o in actual_outcomes])
+        draw_actual = np.array([1.0 if o == "DRAW" else 0.0 for o in actual_outcomes])
+        away_actual = np.array([1.0 if o == "AWAY" else 0.0 for o in actual_outcomes])
+
+        self.home.fit(p_home, home_actual)
+        self.draw.fit(p_draw, draw_actual)
+        self.away.fit(p_away, away_actual)
+
+        logger.info(
+            "MultiClass calibration: home=%s, draw=%s, away=%s",
+            self.home.is_fitted, self.draw.is_fitted, self.away.is_fitted,
+        )
+
+    def calibrate_1x2(
+        self,
+        p_home: float,
+        p_draw: float,
+        p_away: float,
+    ) -> tuple[float, float, float]:
+        """Calibrate and re-normalise 1X2 probabilities.
+
+        Returns (home, draw, away) summing to 1.0.
+        Falls back to raw probabilities when no calibrator is fitted.
+        """
+        c_home = self.home.transform(p_home)
+        c_draw = self.draw.transform(p_draw)
+        c_away = self.away.transform(p_away)
+
+        total = c_home + c_draw + c_away
+        if total <= 0:
+            return p_home, p_draw, p_away
+
+        return (
+            round(c_home / total, 6),
+            round(c_draw / total, 6),
+            round(c_away / total, 6),
+        )

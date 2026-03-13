@@ -6,9 +6,17 @@ Comandos:
     /leagues            — Listar ligas disponibles (canónicas, deduplicadas)
     /matches [liga]     — Próximos partidos (opcionalmente filtrar por liga canónica)
     /predict <número>   — Predicción completa del partido seleccionado
+    /valuebets          — Top value bets actuales
+
+Mejoras v2:
+    - Resiliencia: try/except por comando con NetworkError/TimedOut handling
+    - Alerta diaria: scheduler envía top value bets al admin
+    - Formateo profesional: emojis, bloques HTML, info limpia
+    - Anti-spam: sleep entre envíos masivos
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
@@ -16,12 +24,14 @@ import time
 from dotenv import load_dotenv
 from sqlalchemy.orm import Session
 from telegram import Update
+from telegram.error import NetworkError, RetryAfter, TimedOut
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 from app.db.models.football.match import Match
 from app.db.session import SessionLocal
 from app.services.canonical_league_service import CanonicalLeagueService
 from app.services.prediction.prediction_service import PredictionService
+from app.services.prediction.value_service import ValueService
 
 load_dotenv()
 
@@ -32,9 +42,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
+ADMIN_CHAT_ID: str = os.getenv("ADMIN_CHAT_ID", "")
+DAILY_ALERT_HOUR: int = int(os.getenv("DAILY_ALERT_HOUR", "8"))  # UTC
+
+# Anti-spam: minimum seconds between bulk messages (Telegram limit: 30 msg/s)
+_BULK_SEND_DELAY = 0.05  # 50ms → max ~20 msg/s, well within limits
 
 # In-memory cache of the latest /matches listing per chat.
-# Each entry stores (timestamp, matches) so stale entries can be evicted.
 _CACHE_TTL_SECS = 900  # 15 minutes
 _CACHE_MAX_ENTRIES = 200
 
@@ -42,7 +56,6 @@ _matches_cache: dict[int, tuple[float, list[Match]]] = {}
 
 
 def _cache_get(chat_id: int) -> list[Match] | None:
-    """Return cached matches if still valid, else None."""
     entry = _matches_cache.get(chat_id)
     if entry is None:
         return None
@@ -54,8 +67,6 @@ def _cache_get(chat_id: int) -> list[Match] | None:
 
 
 def _cache_set(chat_id: int, matches: list[Match]) -> None:
-    """Store matches in cache with TTL and evict if over limit."""
-    # Evict oldest entries if cache is too large
     if len(_matches_cache) >= _CACHE_MAX_ENTRIES:
         oldest_key = min(_matches_cache, key=lambda k: _matches_cache[k][0])
         _matches_cache.pop(oldest_key, None)
@@ -66,35 +77,75 @@ def _db() -> Session:
     return SessionLocal()
 
 
-def _escape_html(text: str) -> str:
+def _esc(text: str) -> str:
+    """Escape HTML special characters for Telegram."""
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def _confidence_label(prob: float) -> str:
     if prob >= 0.70:
-        return "Alta"
+        return "🟢 Alta"
     if prob >= 0.50:
-        return "Media"
+        return "🟡 Media"
     if prob >= 0.35:
-        return "Baja"
-    return "Muy baja"
+        return "🟠 Baja"
+    return "🔴 Muy baja"
+
+
+def _pct(v: float) -> str:
+    """Format a probability as percentage string."""
+    return f"{v * 100:.1f}%"
+
+
+async def _safe_reply(update: Update, text: str, **kwargs) -> None:
+    """Send a reply with automatic retry on Telegram transient errors."""
+    try:
+        await update.message.reply_text(text, **kwargs)
+    except RetryAfter as e:
+        logger.warning("Telegram RetryAfter: sleeping %ss", e.retry_after)
+        await asyncio.sleep(e.retry_after)
+        await update.message.reply_text(text, **kwargs)
+    except TimedOut:
+        logger.warning("Telegram TimedOut sending reply — retrying once")
+        await asyncio.sleep(2)
+        await update.message.reply_text(text, **kwargs)
+    except NetworkError:
+        logger.exception("Telegram NetworkError — message not delivered")
+
+
+async def _safe_send(bot, chat_id: int | str, text: str, **kwargs) -> None:
+    """Send a message to a specific chat with retry on transient errors."""
+    try:
+        await bot.send_message(chat_id=chat_id, text=text, **kwargs)
+    except RetryAfter as e:
+        logger.warning("Telegram RetryAfter: sleeping %ss", e.retry_after)
+        await asyncio.sleep(e.retry_after)
+        await bot.send_message(chat_id=chat_id, text=text, **kwargs)
+    except TimedOut:
+        logger.warning("Telegram TimedOut — retrying once")
+        await asyncio.sleep(2)
+        await bot.send_message(chat_id=chat_id, text=text, **kwargs)
+    except NetworkError:
+        logger.exception("Telegram NetworkError — message not delivered to %s", chat_id)
 
 
 # ── /start ────────────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
+    name = _esc(user.first_name or "Usuario")
     msg = (
-        f"Hola {_escape_html(user.first_name or 'Usuario')}!\n\n"
-        "Soy tu bot de predicciones de futbol con modelo Dixon-Coles.\n\n"
-        "<b>Comandos:</b>\n"
-        "/leagues  — Ligas disponibles\n"
-        "/matches  — Próximos partidos (todas las ligas)\n"
-        "/matches &lt;num&gt;  — Partidos de una liga\n"
-        "/predict &lt;num&gt;  — Predicción del partido\n\n"
+        f"👋 ¡Hola <b>{name}</b>!\n\n"
+        "Soy tu bot de predicciones de fútbol con modelo Dixon-Coles.\n\n"
+        "📋 <b>Comandos:</b>\n"
+        "  /leagues  — 🏟️ Ligas disponibles\n"
+        "  /matches  — ⚽ Próximos partidos\n"
+        "  /matches &lt;num&gt;  — Partidos de una liga\n"
+        "  /predict &lt;num&gt;  — 🔮 Predicción del partido\n"
+        "  /valuebets  — 📈 Top value bets\n\n"
         "<i>Ejemplo: /leagues → /matches 1 → /predict 1</i>"
     )
-    await update.message.reply_text(msg, parse_mode="HTML")
+    await _safe_reply(update, msg, parse_mode="HTML")
 
 
 # ── /leagues ──────────────────────────────────────────────────────────────
@@ -107,20 +158,16 @@ async def cmd_leagues(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         leagues = svc.list_leagues()
 
         if not leagues:
-            await update.message.reply_text("No hay ligas registradas en la DB.")
+            await _safe_reply(update, "⚠️ No hay ligas registradas en la DB.")
             return
 
-        lines = ["<b>Ligas disponibles</b>\n"]
+        lines = ["🏟️ <b>Ligas disponibles</b>\n"]
         for lg in leagues:
-            country = f" ({_escape_html(lg.country)})" if lg.country else ""
-            if lg.scheduled_matches == 0:
-                logger.warning(
-                    "Auditoria: liga '%s' (index=%d) sin partidos programados",
-                    lg.display_name, lg.index,
-                )
+            country = f" ({_esc(lg.country)})" if lg.country else ""
+            status = "✅" if lg.scheduled_matches > 0 else "⏸️"
             lines.append(
-                f"  <b>{lg.index}</b> — {_escape_html(lg.display_name)}{country}\n"
-                f"      {lg.finished_matches} jugados | {lg.scheduled_matches} programados"
+                f"  {status} <b>{lg.index}</b> — {_esc(lg.display_name)}{country}\n"
+                f"       {lg.finished_matches} jugados · {lg.scheduled_matches} programados"
             )
 
         lines.append(
@@ -128,7 +175,10 @@ async def cmd_leagues(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "Ejemplo: /matches 1</i>"
         )
 
-        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+        await _safe_reply(update, "\n".join(lines), parse_mode="HTML")
+    except Exception:
+        logger.exception("Error en /leagues")
+        await _safe_reply(update, "⚠️ Error al obtener ligas. Intenta de nuevo.")
     finally:
         db.close()
 
@@ -142,8 +192,9 @@ async def cmd_matches(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         try:
             canonical_index = int(context.args[0])
         except ValueError:
-            await update.message.reply_text(
-                "Liga inválida. Usa /leagues para ver los números disponibles."
+            await _safe_reply(
+                update,
+                "⚠️ Liga inválida. Usa /leagues para ver los números disponibles.",
             )
             return
 
@@ -155,8 +206,9 @@ async def cmd_matches(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if canonical_index is not None:
             leagues = svc.list_leagues()
             if canonical_index < 1 or canonical_index > len(leagues):
-                await update.message.reply_text(
-                    f"Liga fuera de rango. Usa /leagues para ver los números."
+                await _safe_reply(
+                    update,
+                    f"⚠️ Liga fuera de rango. Usa /leagues para ver los números.",
                 )
                 return
             ingested = svc.auto_ingest_if_empty(canonical_index)
@@ -167,8 +219,9 @@ async def cmd_matches(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
         if not upcoming:
             filter_msg = f" para liga {canonical_index}" if canonical_index else ""
-            await update.message.reply_text(
-                f"No hay partidos programados{filter_msg}."
+            await _safe_reply(
+                update,
+                f"📭 No hay partidos programados{filter_msg}.",
             )
             return
 
@@ -178,25 +231,25 @@ async def cmd_matches(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         filter_label = ""
         if canonical_index is not None:
             info = svc.list_leagues()[canonical_index - 1]
-            filter_label = f" ({info.display_name})"
+            filter_label = f" — {info.display_name}"
 
-        lines = [f"<b>Próximos partidos{_escape_html(filter_label)}</b>\n"]
+        lines = [f"⚽ <b>Próximos partidos{_esc(filter_label)}</b>\n"]
         current_league = ""
 
         for idx, m in enumerate(upcoming[:30], 1):
             league_name = svc.display_name_for(m.league_id)
             if league_name != current_league:
                 current_league = league_name
-                lines.append(f"\n<b>{_escape_html(league_name)}</b>")
+                lines.append(f"\n🏆 <b>{_esc(league_name)}</b>")
 
-            home = _escape_html(m.home_team.name if m.home_team else "?")
-            away = _escape_html(m.away_team.name if m.away_team else "?")
+            home = _esc(m.home_team.name if m.home_team else "?")
+            away = _esc(m.away_team.name if m.away_team else "?")
             date_str = m.utc_date.strftime("%d/%m %H:%M") if m.utc_date else "?"
-            rnd = f" (J{_escape_html(m.round)})" if m.round else ""
+            rnd = f" (J{_esc(m.round)})" if m.round else ""
 
             lines.append(
                 f"  <b>{idx}.</b> {home} vs {away}\n"
-                f"      {date_str} UTC{rnd}"
+                f"      🕐 {date_str} UTC{rnd}"
             )
 
         lines.append(
@@ -207,7 +260,10 @@ async def cmd_matches(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         text = "\n".join(lines)
         if len(text) > 4000:
             text = text[:3950] + "\n..."
-        await update.message.reply_text(text, parse_mode="HTML")
+        await _safe_reply(update, text, parse_mode="HTML")
+    except Exception:
+        logger.exception("Error en /matches")
+        await _safe_reply(update, "⚠️ Error al obtener partidos. Intenta de nuevo.")
     finally:
         db.close()
 
@@ -217,8 +273,9 @@ async def cmd_matches(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 async def cmd_predict(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Predict the match selected by number from /matches."""
     if not context.args:
-        await update.message.reply_text(
-            "Uso: /predict &lt;num&gt;\n\n"
+        await _safe_reply(
+            update,
+            "ℹ️ Uso: /predict &lt;num&gt;\n\n"
             "Primero usa /matches para ver la lista.",
             parse_mode="HTML",
         )
@@ -227,27 +284,26 @@ async def cmd_predict(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     try:
         choice = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("El numero debe ser un entero. Ejemplo: /predict 1")
+        await _safe_reply(update, "⚠️ El número debe ser un entero. Ejemplo: /predict 1")
         return
 
     chat_id = update.effective_chat.id
     cached = _cache_get(chat_id)
     if not cached:
-        await update.message.reply_text(
-            "No hay listado activo. Usa /matches primero."
-        )
+        await _safe_reply(update, "⚠️ No hay listado activo. Usa /matches primero.")
         return
 
     if choice < 1 or choice > len(cached):
-        await update.message.reply_text(
-            f"Numero fuera de rango. Elige entre 1 y {len(cached)}."
+        await _safe_reply(
+            update,
+            f"⚠️ Número fuera de rango. Elige entre 1 y {len(cached)}.",
         )
         return
 
     match_obj = cached[choice - 1]
     match_id = match_obj.id
 
-    await update.message.reply_text("Calculando prediccion...")
+    await _safe_reply(update, "🔄 Calculando predicción...")
 
     db = _db()
     try:
@@ -255,92 +311,221 @@ async def cmd_predict(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         result = service.predict_match(match_id)
 
         if result is None:
-            await update.message.reply_text(
-                "No se pudo generar prediccion. "
-                "Datos historicos insuficientes (minimo 30 partidos)."
+            await _safe_reply(
+                update,
+                "⚠️ No se pudo generar predicción.\n"
+                "Datos históricos insuficientes (mínimo 30 partidos).",
             )
             return
 
-        home = _escape_html(result["home_team"])
-        away = _escape_html(result["away_team"])
-        p_h = result["p_home"]
-        p_d = result["p_draw"]
-        p_a = result["p_away"]
-
-        # Determine favorite
-        if p_h >= p_d and p_h >= p_a:
-            tip, conf = f"1 ({home})", p_h
-        elif p_a >= p_d:
-            tip, conf = f"2 ({away})", p_a
-        else:
-            tip, conf = "X (Empate)", p_d
-
-        lines = [
-            f"<b>{home}  vs  {away}</b>",
-            f"{_escape_html(result.get('league', ''))}",
-        ]
-        if result.get("utc_date"):
-            lines.append(result["utc_date"].strftime("%d/%m/%Y %H:%M UTC"))
-
-        lines.append("")
-        lines.append(f"Prediccion: <b>{tip}</b> ({conf * 100:.1f}% — {_confidence_label(conf)})")
-
-        # 1X2
-        lines.append(
-            f"\n<b>1X2:</b>  Local {p_h * 100:.1f}%  |  Empate {p_d * 100:.1f}%  |  Visitante {p_a * 100:.1f}%"
-        )
-
-        # xG
-        xg_h = result.get("xg_home", 0)
-        xg_a = result.get("xg_away", 0)
-        if xg_h or xg_a:
-            lines.append(f"<b>xG:</b>  {home} {xg_h:.2f} - {xg_a:.2f} {away}")
-
-        # Over/Under
-        ou_parts: list[str] = []
-        if result.get("p_over_1_5") is not None:
-            ou_parts.append(f"O1.5 {result['p_over_1_5'] * 100:.0f}%")
-        if result.get("p_over_2_5") is not None:
-            ou_parts.append(f"O2.5 {result['p_over_2_5'] * 100:.0f}%")
-        if result.get("p_over_3_5") is not None:
-            ou_parts.append(f"O3.5 {result['p_over_3_5'] * 100:.0f}%")
-        if ou_parts:
-            lines.append(f"<b>Over/Under:</b>  {' | '.join(ou_parts)}")
-
-        # BTTS
-        if result.get("p_btts_yes") is not None:
-            lines.append(
-                f"<b>BTTS:</b>  Si {result['p_btts_yes'] * 100:.0f}%  |  "
-                f"No {result['p_btts_no'] * 100:.0f}%"
-            )
-
-        # Double chance
-        if result.get("p_1x") is not None:
-            lines.append(
-                f"<b>Doble oportunidad:</b>  "
-                f"1X {result['p_1x'] * 100:.0f}%  |  "
-                f"X2 {result['p_x2'] * 100:.0f}%  |  "
-                f"12 {result['p_12'] * 100:.0f}%"
-            )
-
-        # Top scorelines
-        top = result.get("top_scorelines")
-        if top:
-            scores = [f"{s}: {p}%" for s, p in list(top.items())[:5]]
-            lines.append(f"<b>Marcadores:</b>  {', '.join(scores)}")
-
-        lines.append(f"\n<i>{result.get('data_quality', '')}</i>")
-
-        text = "\n".join(lines)
-        if len(text) > 4000:
-            text = text[:3950] + "\n..."
-        await update.message.reply_text(text, parse_mode="HTML")
+        text = _format_prediction(result)
+        await _safe_reply(update, text, parse_mode="HTML")
     except Exception:
         logger.exception("Error en /predict %s (match_id=%s)", choice, match_id)
-        await update.message.reply_text("Error al generar la prediccion.")
+        await _safe_reply(
+            update,
+            "⚠️ El motor de predicción no pudo procesar la solicitud.\n"
+            "Intenta de nuevo en unos minutos.",
+        )
     finally:
         db.close()
 
+
+def _format_prediction(result) -> str:
+    """Build a professional HTML-formatted prediction message."""
+    home = _esc(result.home_team)
+    away = _esc(result.away_team)
+    p_h = result.p_home
+    p_d = result.p_draw
+    p_a = result.p_away
+
+    # Determine favorite
+    if p_h >= p_d and p_h >= p_a:
+        tip, conf = f"1 ({home})", p_h
+    elif p_a >= p_d:
+        tip, conf = f"2 ({away})", p_a
+    else:
+        tip, conf = "X (Empate)", p_d
+
+    lines = [
+        f"⚽ <b>{home}  vs  {away}</b>",
+        f"🏆 {_esc(result.league or '')}",
+    ]
+    if result.utc_date:
+        lines.append(f"🕐 {result.utc_date.strftime('%d/%m/%Y %H:%M')} UTC")
+
+    lines.append("")
+    lines.append(
+        f"🔮 Predicción: <b>{tip}</b>\n"
+        f"    Confianza: <b>{_pct(conf)}</b> — {_confidence_label(conf)}"
+    )
+
+    # ── 1X2 ──
+    lines.append(
+        f"\n📊 <b>1X2</b>\n"
+        f"    Local <b>{_pct(p_h)}</b>  ·  Empate <b>{_pct(p_d)}</b>  ·  Visitante <b>{_pct(p_a)}</b>"
+    )
+
+    # ── xG ──
+    xg_h = result.xg_home or 0
+    xg_a = result.xg_away or 0
+    if xg_h or xg_a:
+        lines.append(f"📈 <b>xG:</b>  {home} <b>{xg_h:.2f}</b> — <b>{xg_a:.2f}</b> {away}")
+
+    # ── Over/Under ──
+    ou_parts: list[str] = []
+    if result.p_over_1_5 is not None:
+        ou_parts.append(f"O1.5 <b>{_pct(result.p_over_1_5)}</b>")
+    if result.p_over_2_5 is not None:
+        ou_parts.append(f"O2.5 <b>{_pct(result.p_over_2_5)}</b>")
+    if result.p_over_3_5 is not None:
+        ou_parts.append(f"O3.5 <b>{_pct(result.p_over_3_5)}</b>")
+    if ou_parts:
+        lines.append(f"⬆️ <b>Over/Under:</b>  {' · '.join(ou_parts)}")
+
+    # ── BTTS ──
+    if result.p_btts_yes is not None:
+        lines.append(
+            f"🎯 <b>BTTS:</b>  Sí <b>{_pct(result.p_btts_yes)}</b>  ·  "
+            f"No <b>{_pct(result.p_btts_no)}</b>"
+        )
+
+    # ── Double chance ──
+    lines.append(
+        f"🔄 <b>Doble oportunidad:</b>\n"
+        f"    1X <b>{_pct(result.p_1x)}</b>  ·  "
+        f"X2 <b>{_pct(result.p_x2)}</b>  ·  "
+        f"12 <b>{_pct(result.p_12)}</b>"
+    )
+
+    # ── Top scorelines ──
+    top = result.top_scorelines
+    if top:
+        scores = [f"<b>{s}</b> {p}%" for s, p in list(top.items())[:5]]
+        lines.append(f"🥅 <b>Marcadores:</b>  {', '.join(scores)}")
+
+    # ── Data quality footer ──
+    lines.append(f"\n<i>ℹ️ {result.data_quality or ''}</i>")
+
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:3950] + "\n..."
+    return text
+
+
+# ── /valuebets ────────────────────────────────────────────────────────────
+
+async def cmd_valuebets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show top value bets (model vs market)."""
+    db = _db()
+    try:
+        svc = ValueService(db)
+        bets = svc.top_value_bets(min_edge=0.03, limit=10)
+
+        if not bets:
+            await _safe_reply(
+                update,
+                "📭 No hay value bets disponibles.\n"
+                "Necesitas odds de mercado cargadas para detectar valor.",
+            )
+            return
+
+        text = _format_value_bets(bets, db)
+        await _safe_reply(update, text, parse_mode="HTML")
+    except Exception:
+        logger.exception("Error en /valuebets")
+        await _safe_reply(
+            update,
+            "⚠️ Error al obtener value bets. Intenta de nuevo.",
+        )
+    finally:
+        db.close()
+
+
+def _format_value_bets(bets: list[dict], db: Session) -> str:
+    """Build HTML message for top value bets."""
+    from app.repositories.football.match_repository import MatchRepository
+
+    repo = MatchRepository(db)
+    lines = ["📈 <b>Top Value Bets</b>\n"]
+
+    for i, bet in enumerate(bets, 1):
+        match = repo.get_by_id(bet["match_id"])
+        if not match:
+            continue
+
+        home = _esc(match.home_team.name if match.home_team else "?")
+        away = _esc(match.away_team.name if match.away_team else "?")
+        best = bet["best_value"]
+        outcome_map = {"home": f"1 ({home})", "draw": "X", "away": f"2 ({away})"}
+        outcome_label = outcome_map.get(best["outcome"], best["outcome"])
+        edge_pct = best["edge"] * 100
+
+        odds_data = bet["market_odds"]
+        date_str = match.utc_date.strftime("%d/%m %H:%M") if match.utc_date else ""
+
+        lines.append(
+            f"<b>{i}.</b> {home} vs {away}\n"
+            f"    🕐 {date_str} UTC\n"
+            f"    💰 Apuesta: <b>{outcome_label}</b>\n"
+            f"    📈 Edge: <b>+{edge_pct:.1f}%</b>\n"
+            f"    📊 Cuotas: {odds_data['home']:.2f} / {odds_data['draw']:.2f} / {odds_data['away']:.2f}\n"
+        )
+
+    lines.append("<i>Edge = ventaja del modelo sobre el mercado (multiplicativa)</i>")
+
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:3950] + "\n..."
+    return text
+
+
+# ── Daily alert job ───────────────────────────────────────────────────────
+
+async def _daily_value_bets_alert(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send daily top value bets to the admin chat."""
+    if not ADMIN_CHAT_ID:
+        return
+
+    db = _db()
+    try:
+        svc = ValueService(db)
+        bets = svc.top_value_bets(min_edge=0.03, limit=5)
+
+        if not bets:
+            text = "📭 <b>Reporte diario:</b> No hay value bets disponibles hoy."
+        else:
+            text = "📅 <b>Reporte diario de Value Bets</b>\n\n" + _format_value_bets(bets, db)
+
+        await _safe_send(context.bot, ADMIN_CHAT_ID, text, parse_mode="HTML")
+        # Anti-spam delay after bulk-capable send
+        await asyncio.sleep(_BULK_SEND_DELAY)
+    except Exception:
+        logger.exception("Error en alerta diaria de value bets")
+    finally:
+        db.close()
+
+
+# ── Global error handler ─────────────────────────────────────────────────
+
+async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Catch-all error handler: log and notify user if possible."""
+    logger.exception("Unhandled exception in bot handler", exc_info=context.error)
+
+    if isinstance(context.error, (NetworkError, TimedOut)):
+        logger.warning("Telegram network issue: %s", context.error)
+        return  # transient — don't bother the user
+
+    if isinstance(update, Update) and update.message:
+        try:
+            await update.message.reply_text(
+                "⚠️ Ocurrió un error inesperado. Intenta de nuevo en unos minutos.",
+            )
+        except Exception:
+            pass  # can't send — network is likely down
+
+
+# ── main ──────────────────────────────────────────────────────────────────
 
 def main() -> None:
     token = TELEGRAM_BOT_TOKEN
@@ -349,10 +534,30 @@ def main() -> None:
         return
 
     app = Application.builder().token(token).build()
+
+    # Command handlers
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("leagues", cmd_leagues))
     app.add_handler(CommandHandler("matches", cmd_matches))
     app.add_handler(CommandHandler("predict", cmd_predict))
+    app.add_handler(CommandHandler("valuebets", cmd_valuebets))
+
+    # Global error handler — prevents crashes on unhandled exceptions
+    app.add_error_handler(_error_handler)
+
+    # Daily value bets alert (via python-telegram-bot's JobQueue)
+    if ADMIN_CHAT_ID:
+        from datetime import time as dt_time, timezone as tz
+
+        app.job_queue.run_daily(
+            _daily_value_bets_alert,
+            time=dt_time(hour=DAILY_ALERT_HOUR, minute=0, tzinfo=tz.utc),
+            name="daily_value_bets",
+        )
+        logger.info(
+            "Alerta diaria configurada: %02d:00 UTC → chat %s",
+            DAILY_ALERT_HOUR, ADMIN_CHAT_ID,
+        )
 
     logger.info("Bot iniciado — polling…")
     app.run_polling(allowed_updates=Update.ALL_TYPES)

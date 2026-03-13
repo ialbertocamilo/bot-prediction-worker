@@ -63,13 +63,19 @@ class MatchStatsRepository:
         self.db.refresh(stats)
         return stats
 
+    _UPDATABLE_FIELDS: frozenset[str] = frozenset({
+        "possession_pct", "shots", "shots_on_target", "xg", "xga",
+        "corners", "fouls", "offsides", "yellow_cards", "red_cards",
+        "passes", "pass_accuracy_pct",
+    })
+
     def update(
         self,
         stats: MatchStats,
         **kwargs: object,
     ) -> MatchStats:
         for key, value in kwargs.items():
-            if hasattr(stats, key):
+            if key in self._UPDATABLE_FIELDS and value is not None:
                 setattr(stats, key, value)
         self.db.flush()
         self.db.refresh(stats)

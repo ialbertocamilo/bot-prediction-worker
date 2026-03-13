@@ -1,4 +1,4 @@
-from sqlalchemy import Float, String, DateTime, ForeignKey, func, Index, UniqueConstraint
+from sqlalchemy import Float, String, DateTime, ForeignKey, func, Index
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -40,6 +40,5 @@ class Prediction(Base):
     model = relationship("Model", lazy="select")
 
     __table_args__ = (
-        UniqueConstraint("match_id", "model_id", name="uq_predictions_match_model"),
         Index("ix_predictions_match_model_time", "match_id", "model_id", "created_at"),
     )

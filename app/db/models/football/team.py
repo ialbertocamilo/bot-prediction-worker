@@ -1,4 +1,4 @@
-from sqlalchemy import String, Integer, DateTime, func, Index
+from sqlalchemy import String, Integer, DateTime, func, Index, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -21,5 +21,6 @@ class Team(Base):
     )
 
     __table_args__ = (
+        UniqueConstraint("name", "country", name="uq_teams_name_country"),
         Index("ix_teams_name_country", "name", "country"),
     )

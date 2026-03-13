@@ -38,9 +38,15 @@ def main() -> None:
     parser.add_argument("--league-id", type=int, default=None, help="ID de liga (default: todas)")
     parser.add_argument(
         "--mode",
-        choices=["coarse", "fine", "full"],
+        choices=["coarse", "fine", "full", "random"],
         default="fine",
-        help="coarse: 27 combos rápidos | fine: coarse→refine (default) | full: 294 combos",
+        help="coarse: 27 combos | fine: coarse→refine (default) | full: 294 combos | random: n_iter samples",
+    )
+    parser.add_argument(
+        "--n-iter",
+        type=int,
+        default=30,
+        help="Number of random combos to sample (only for --mode random, default: 30)",
     )
     args = parser.parse_args()
 
@@ -51,6 +57,8 @@ def main() -> None:
             report = svc.run_coarse()
         elif args.mode == "fine":
             report = svc.run_fine()
+        elif args.mode == "random":
+            report = svc.run_random(n_iter=args.n_iter)
         else:
             report = svc.run()
         print(report.summary())

@@ -13,26 +13,18 @@ from dataclasses import asdict
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
-from app.db.session import SessionLocal
+from app.api.dependencies import get_db
 from app.services.prediction.model_evaluation_service import ModelEvaluationService
 from app.services.prediction.bankroll_simulator import BankrollSimulator, FlatStakeStrategy
 
 router = APIRouter()
 
 
-def _get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-
 @router.get("/evaluation")
 def model_evaluation(
     league_id: int | None = Query(None, description="Filtrar por liga"),
     season_id: int | None = Query(None, description="Filtrar por temporada"),
-    db: Session = Depends(_get_db),
+    db: Session = Depends(get_db),
 ):
     """Model quality metrics: Brier Score & Log Loss.
 
@@ -76,7 +68,7 @@ def model_evaluation(
 @router.get("/calibration")
 def model_calibration(
     bins: int = Query(10, ge=2, le=50, description="Número de bins"),
-    db: Session = Depends(_get_db),
+    db: Session = Depends(get_db),
 ):
     """Calibration curve data: predicted probability vs actual frequency per bin."""
     svc = ModelEvaluationService(db)
@@ -93,7 +85,7 @@ def bankroll_simulation(
     stake_size: float = Query(10.0, ge=0.01, description="Stake fijo por apuesta"),
     min_edge: float = Query(0.03, ge=0.0, le=1.0, description="Edge mínimo para apostar"),
     max_bets: int | None = Query(None, ge=1, description="Máximo de apuestas"),
-    db: Session = Depends(_get_db),
+    db: Session = Depends(get_db),
 ):
     """Hypothetical bankroll simulation using flat-stake strategy.
 

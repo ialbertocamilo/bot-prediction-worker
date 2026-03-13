@@ -24,7 +24,7 @@ class RawRecordRepository:
             source_id=source_id,
             entity_type=entity_type,
             external_id=external_id,
-            fetched_at=fetched_at or datetime.utcnow(),
+            fetched_at=fetched_at or datetime.now(timezone.utc),
             payload=payload,
         )
         self.db.add(raw_record)

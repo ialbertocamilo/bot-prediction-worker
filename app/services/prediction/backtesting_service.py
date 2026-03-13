@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import math
+
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -21,7 +22,8 @@ from sqlalchemy.orm import Session
 from app.db.models.football.match import Match
 from app.db.models.football.match_stats import MatchStats
 from app.services.prediction.dixon_coles import DixonColesModel, MatchData
-from config import HOME_ADVANTAGE, TIME_DECAY, XG_REG_WEIGHT
+from app.services.prediction.training_data import build_training_data, load_xg_map
+from config import HOME_ADVANTAGE, TIME_DECAY, XG_REG_WEIGHT, MIN_XG_MATCHES
 
 logger = logging.getLogger(__name__)
 
@@ -103,7 +105,7 @@ class BacktestingService:
         logger.info("Backtest: %d partidos terminados cargados", len(matches))
 
         all_ids = [m.id for m in matches]
-        xg_map = self._load_xg_map(all_ids)
+        xg_map = load_xg_map(self.db, all_ids)
 
         report = BacktestReport()
         eps = 1e-10  # clamp for log
@@ -116,37 +118,10 @@ class BacktestingService:
                 report.skipped_matches += 1
                 continue
 
-            # Build MatchData with time-decay relative to the target match date
             ref_ts = target.utc_date
-            match_data: list[MatchData] = []
-            xg_for_lists: dict[int, list[float]] = {}
-            xg_against_lists: dict[int, list[float]] = {}
-
-            for m in training_pool:
-                if m.home_goals is None or m.away_goals is None:
-                    continue
-                days_ago = 0.0
-                if m.utc_date and ref_ts:
-                    delta = (ref_ts - m.utc_date).total_seconds() / 86400.0
-                    days_ago = max(delta, 0.0)
-                w = math.exp(-self._time_decay * days_ago)
-
-                match_data.append(MatchData(
-                    home_team_id=m.home_team_id,
-                    away_team_id=m.away_team_id,
-                    home_goals=m.home_goals,
-                    away_goals=m.away_goals,
-                    weight=w,
-                ))
-
-                pair = xg_map.get(m.id, {})
-                h_xg = pair.get(m.home_team_id)
-                a_xg = pair.get(m.away_team_id)
-                if h_xg is not None and a_xg is not None:
-                    xg_for_lists.setdefault(m.home_team_id, []).append(h_xg)
-                    xg_against_lists.setdefault(m.home_team_id, []).append(a_xg)
-                    xg_for_lists.setdefault(m.away_team_id, []).append(a_xg)
-                    xg_against_lists.setdefault(m.away_team_id, []).append(h_xg)
+            match_data, xg_priors = build_training_data(
+                training_pool, ref_ts, self._time_decay, xg_map, MIN_XG_MATCHES,
+            )
 
             if len(match_data) < MIN_TRAINING:
                 report.skipped_matches += 1
@@ -159,13 +134,6 @@ class BacktestingService:
             if target.home_team_id not in train_teams or target.away_team_id not in train_teams:
                 report.skipped_matches += 1
                 continue
-
-            # Build xG priors
-            xg_priors: dict[int, tuple[float, float]] = {}
-            for tid in set(xg_for_lists) & set(xg_against_lists):
-                avg_for = sum(xg_for_lists[tid]) / len(xg_for_lists[tid])
-                avg_against = sum(xg_against_lists[tid]) / len(xg_against_lists[tid])
-                xg_priors[tid] = (avg_for, avg_against)
 
             # Fit and predict
             dc = DixonColesModel(time_decay=self._time_decay, home_adv_init=self._home_adv_init)
@@ -235,12 +203,12 @@ class BacktestingService:
                 # Brier Score (multiclass)
                 total_bs += sum((p - a) ** 2 for p, a in zip(probs, actual_vec))
 
-                # Calibration: bin the probability of the predicted class
-                p_pred = probs[mp.predicted_outcome]
-                hit = 1 if mp.predicted_outcome == mp.actual_outcome else 0
-                bin_idx = min(int(p_pred * 10), 9)
-                label = f"{bin_idx * 10:>2d}-{(bin_idx + 1) * 10:>2d}%"
-                cal_bins.setdefault(label, []).append((p_pred, hit))
+                # Calibration: bin ALL three outcome probabilities (not just predicted)
+                for cls_idx, (p_cls, a_cls) in enumerate(zip(probs, actual_vec)):
+                    hit = int(a_cls == 1.0)
+                    bin_idx = min(int(p_cls * 10), 9)
+                    label = f"{bin_idx * 10:>2d}-{(bin_idx + 1) * 10:>2d}%"
+                    cal_bins.setdefault(label, []).append((p_cls, hit))
 
             report.log_loss = total_ll / report.total_matches
             report.brier_score = total_bs / report.total_matches
@@ -268,20 +236,3 @@ class BacktestingService:
         if self.league_id is not None:
             stmt = stmt.where(Match.league_id == self.league_id)
         return list(self.db.scalars(stmt).all())
-
-    def _load_xg_map(self, match_ids: list[int]) -> dict[int, dict[int, float]]:
-        if not match_ids:
-            return {}
-        # SQLAlchemy IN with large lists — batch if needed
-        result: dict[int, dict[int, float]] = {}
-        batch_size = 500
-        for start in range(0, len(match_ids), batch_size):
-            batch = match_ids[start: start + batch_size]
-            stmt = (
-                select(MatchStats.match_id, MatchStats.team_id, MatchStats.xg)
-                .where(MatchStats.match_id.in_(batch))
-                .where(MatchStats.xg.isnot(None))
-            )
-            for row in self.db.execute(stmt):
-                result.setdefault(row.match_id, {})[row.team_id] = row.xg
-        return result

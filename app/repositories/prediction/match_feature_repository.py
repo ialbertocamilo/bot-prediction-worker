@@ -71,16 +71,21 @@ class MatchFeatureRepository:
         away_goals_against_avg: float | None = None,
         features_hash: str | None = None,
     ) -> MatchFeature:
-        feature.lambda_home = lambda_home
-        feature.lambda_away = lambda_away
-        feature.rating_home = rating_home
-        feature.rating_away = rating_away
-        feature.rating_diff = rating_diff
-        feature.home_goals_for_avg = home_goals_for_avg
-        feature.home_goals_against_avg = home_goals_against_avg
-        feature.away_goals_for_avg = away_goals_for_avg
-        feature.away_goals_against_avg = away_goals_against_avg
-        feature.features_hash = features_hash
+        _updates: dict[str, object] = {
+            "lambda_home": lambda_home,
+            "lambda_away": lambda_away,
+            "rating_home": rating_home,
+            "rating_away": rating_away,
+            "rating_diff": rating_diff,
+            "home_goals_for_avg": home_goals_for_avg,
+            "home_goals_against_avg": home_goals_against_avg,
+            "away_goals_for_avg": away_goals_for_avg,
+            "away_goals_against_avg": away_goals_against_avg,
+            "features_hash": features_hash,
+        }
+        for key, value in _updates.items():
+            if value is not None:
+                setattr(feature, key, value)
 
         self.db.flush()
         self.db.refresh(feature)
