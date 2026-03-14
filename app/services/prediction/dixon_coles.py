@@ -241,6 +241,12 @@ class DixonColesModel:
         pm[0, 1] *= (1.0 + lam_h * p.rho)
         pm[1, 0] *= (1.0 + lam_a * p.rho)
         pm[1, 1] *= (1.0 - p.rho)
+        neg_mask = pm < 0
+        if neg_mask.any():
+            logger.warning(
+                "τ correction produced %d negative cells (λ=%.2f,%.2f ρ=%.3f) — clamped to 0",
+                int(neg_mask.sum()), lam_h, lam_a, p.rho,
+            )
         np.maximum(pm, 0.0, out=pm)
 
         total = pm.sum()
@@ -304,6 +310,94 @@ class DixonColesModel:
             "defense_home": round(d_h, 4),
             "attack_away": round(a_a, 4),
             "defense_away": round(d_a, 4),
+        }
+
+    @staticmethod
+    def predict_from_lambdas(
+        lambda_home: float,
+        lambda_away: float,
+        rho: float = 0.0,
+    ) -> dict:
+        """Build the full probability grid from pre-computed expected goals.
+
+        Used by the cross-league router where lambdas are assembled from
+        two separate domestic models and adjusted by strength coefficients.
+        """
+        lam_h = max(min(lambda_home, math.exp(5)), 1e-6)
+        lam_a = max(min(lambda_away, math.exp(5)), 1e-6)
+
+        goals = np.arange(MAX_GOALS + 1)
+        pmf_h = poisson_dist.pmf(goals, lam_h)
+        pmf_a = poisson_dist.pmf(goals, lam_a)
+        pm = np.outer(pmf_h, pmf_a)
+
+        # Dixon-Coles τ correction
+        pm[0, 0] *= (1.0 - lam_h * lam_a * rho)
+        pm[0, 1] *= (1.0 + lam_h * rho)
+        pm[1, 0] *= (1.0 + lam_a * rho)
+        pm[1, 1] *= (1.0 - rho)
+        neg_mask = pm < 0
+        if neg_mask.any():
+            logger.warning(
+                "predict_from_lambdas: τ correction produced %d negative cells "
+                "(λ=%.2f,%.2f ρ=%.3f) — clamped to 0",
+                int(neg_mask.sum()), lam_h, lam_a, rho,
+            )
+        np.maximum(pm, 0.0, out=pm)
+
+        total = pm.sum()
+        if total > 0:
+            pm /= total
+
+        p_home = float(np.tril(pm, -1).sum())
+        p_away = float(np.triu(pm, 1).sum())
+        p_draw = float(np.trace(pm))
+        s = p_home + p_draw + p_away
+        if s > 0:
+            p_home /= s; p_draw /= s; p_away /= s
+        else:
+            p_home = p_draw = p_away = 1.0 / 3
+
+        goals_grid = np.add.outer(np.arange(MAX_GOALS + 1), np.arange(MAX_GOALS + 1))
+        p_under_1_5 = float(pm[goals_grid <= 1].sum())
+        p_under_2_5 = float(pm[goals_grid <= 2].sum())
+        p_under_3_5 = float(pm[goals_grid <= 3].sum())
+
+        p_btts_no = float(pm[0, :].sum()) + float(pm[:, 0].sum()) - float(pm[0, 0])
+        p_btts_yes = 1.0 - p_btts_no
+
+        scorelines: list[tuple[int, int, float]] = []
+        for i in range(min(7, MAX_GOALS + 1)):
+            for j in range(min(7, MAX_GOALS + 1)):
+                scorelines.append((i, j, float(pm[i, j])))
+        scorelines.sort(key=lambda x: x[2], reverse=True)
+        top = {f"{sc[0]}-{sc[1]}": round(sc[2] * 100, 1) for sc in scorelines[:8]}
+
+        return {
+            "p_home": round(p_home, 4),
+            "p_draw": round(p_draw, 4),
+            "p_away": round(p_away, 4),
+            "xg_home": round(lam_h, 2),
+            "xg_away": round(lam_a, 2),
+            "p_over_1_5": round(1.0 - p_under_1_5, 4),
+            "p_under_1_5": round(p_under_1_5, 4),
+            "p_over_2_5": round(1.0 - p_under_2_5, 4),
+            "p_under_2_5": round(p_under_2_5, 4),
+            "p_over_3_5": round(1.0 - p_under_3_5, 4),
+            "p_under_3_5": round(p_under_3_5, 4),
+            "p_btts_yes": round(p_btts_yes, 4),
+            "p_btts_no": round(p_btts_no, 4),
+            "p_1x": round(p_home + p_draw, 4),
+            "p_x2": round(p_draw + p_away, 4),
+            "p_12": round(p_home + p_away, 4),
+            "top_scorelines": top,
+            "rho": round(rho, 4),
+            "lambda_home": round(lam_h, 4),
+            "lambda_away": round(lam_a, 4),
+            "attack_home": 0.0,
+            "defense_home": 0.0,
+            "attack_away": 0.0,
+            "defense_away": 0.0,
         }
 
 

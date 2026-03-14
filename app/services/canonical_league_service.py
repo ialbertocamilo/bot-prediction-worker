@@ -44,6 +44,7 @@ class _LeagueGroup:
     provider_name: str | None = None
     provider_league_id: int | None = None
     provider_season: int | None = None
+    strength_coefficient: float = 1.0       # cross-league relative strength
 
 
 LEAGUE_GROUPS: list[_LeagueGroup] = [
@@ -57,6 +58,7 @@ LEAGUE_GROUPS: list[_LeagueGroup] = [
         provider_name="espn-scraper",
         provider_league_id=670,
         provider_season=2026,
+        strength_coefficient=0.70,
     ),
     _LeagueGroup(
         key="champions-league",
@@ -75,6 +77,7 @@ LEAGUE_GROUPS: list[_LeagueGroup] = [
         league_names=["English Premier League", "Premier League"],
         provider_slug="eng.1",
         provider_name="espn-scraper",
+        strength_coefficient=1.15,
     ),
     _LeagueGroup(
         key="la-liga",
@@ -84,6 +87,7 @@ LEAGUE_GROUPS: list[_LeagueGroup] = [
         league_names=["Spanish LaLiga", "La Liga", "LaLiga"],
         provider_slug="esp.1",
         provider_name="espn-scraper",
+        strength_coefficient=1.10,
     ),
     _LeagueGroup(
         key="bundesliga",
@@ -93,6 +97,7 @@ LEAGUE_GROUPS: list[_LeagueGroup] = [
         league_names=["German Bundesliga", "Bundesliga"],
         provider_slug="ger.1",
         provider_name="espn-scraper",
+        strength_coefficient=1.05,
     ),
     _LeagueGroup(
         key="serie-a",
@@ -102,6 +107,7 @@ LEAGUE_GROUPS: list[_LeagueGroup] = [
         league_names=["Italian Serie A", "Serie A"],
         provider_slug="ita.1",
         provider_name="espn-scraper",
+        strength_coefficient=1.05,
     ),
     _LeagueGroup(
         key="ligue-1",
@@ -120,6 +126,7 @@ LEAGUE_GROUPS: list[_LeagueGroup] = [
         league_names=["Major League Soccer", "MLS"],
         provider_slug="usa.1",
         provider_name="espn-scraper",
+        strength_coefficient=0.85,
     ),
     _LeagueGroup(
         key="europa-league",
@@ -163,6 +170,20 @@ def domestic_key_for_league_name(league_name: str) -> str | None:
             if ln == pl or pl in ln or ln in pl:
                 return g.key
     return None
+
+
+# ── Lookup: canonical key → strength coefficient ──────────────────────────
+
+_KEY_TO_GROUP: dict[str, _LeagueGroup] = {g.key: g for g in LEAGUE_GROUPS}
+
+
+def strength_coefficient_for_key(key: str) -> float:
+    """Return the strength_coefficient for a canonical league key.
+
+    Defaults to 1.0 for unknown keys.
+    """
+    g = _KEY_TO_GROUP.get(key)
+    return g.strength_coefficient if g is not None else 1.0
 
 
 # ── Tipo público para consumidores ────────────────────────────────────────

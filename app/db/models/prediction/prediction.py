@@ -33,7 +33,7 @@ class Prediction(Base):
 
     top_scorelines: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
-    data_quality: Mapped[str | None] = mapped_column(String(40), nullable=True)  
+    data_quality: Mapped[str | None] = mapped_column(String(100), nullable=True)
     features_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     match = relationship("Match", lazy="select")

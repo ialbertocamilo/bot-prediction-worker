@@ -19,7 +19,7 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-_MIN_SAMPLES = 50
+_MIN_SAMPLES = 30
 
 
 class PlattCalibrator:

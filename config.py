@@ -4,9 +4,14 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Dixon-Coles time-decay factor (γ): weight = exp(-γ * days_since_match)
-# 0.005 ≈ half-life ~139 days, consistent with DC literature
-TIME_DECAY = float(os.getenv("TIME_DECAY", "0.005"))
+# Dixon-Coles time-decay factor (ξ): weight = exp(-ξ * days_since_match)
+# 0.0065 ≈ half-life ~107 days — heavier recent weighting for small samples.
+# Combined with 365-day rolling window for training data.
+TIME_DECAY = float(os.getenv("TIME_DECAY", "0.0065"))
+
+# Rolling window size in days for training data.
+# Only matches within this window before the target date are used.
+TRAINING_WINDOW_DAYS = int(os.getenv("TRAINING_WINDOW_DAYS", "365"))
 
 # xG regularization weight for Dixon-Coles attack/defense priors.
 # Higher values pull parameters more toward xG-implied strengths.
@@ -25,4 +30,5 @@ HOME_ADVANTAGE = float(os.getenv("HOME_ADVANTAGE", "0.25"))
 CALIBRATION_ENABLED = os.getenv("CALIBRATION_ENABLED", "true").lower() in ("true", "1", "yes")
 
 # Minimum evaluated predictions required before Platt calibration kicks in.
-CALIBRATION_MIN_SAMPLES = int(os.getenv("CALIBRATION_MIN_SAMPLES", "50"))
+# Lowered to 30 to allow early-season calibration (Jornada 10-12).
+CALIBRATION_MIN_SAMPLES = int(os.getenv("CALIBRATION_MIN_SAMPLES", "30"))

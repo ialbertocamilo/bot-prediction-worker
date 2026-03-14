@@ -20,8 +20,8 @@ router = APIRouter()
 
 def _fair_odds(prob: float) -> float:
     if prob <= 0:
-        return 99.0
-    return round(1.0 / prob, 2)
+        return 999.0
+    return min(round(1.0 / prob, 2), 999.0)
 
 
 def _value_analysis(p_home: float, p_draw: float, p_away: float,
@@ -145,6 +145,7 @@ def upcoming(
 @router.get("/{match_id}")
 def predict(
     match_id: int,
+    force: bool = Query(False, description="Ignorar caché y recalcular predicción"),
     odds_home: float | None = Query(None, description="Cuota decimal del local"),
     odds_draw: float | None = Query(None, description="Cuota decimal del empate"),
     odds_away: float | None = Query(None, description="Cuota decimal del visitante"),
@@ -158,7 +159,7 @@ def predict(
     con EV, Kelly criterion y detección de value bets.
     """
     service = PredictionService(db)
-    result = service.predict_match(match_id)
+    result = service.predict_match(match_id, force=force)
     if result is None:
         raise HTTPException(
             status_code=404,

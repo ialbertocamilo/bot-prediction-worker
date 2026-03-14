@@ -197,6 +197,28 @@ class MatchRepository:
         )
         return list(self.db.scalars(stmt).all())
 
+    def list_by_team(
+        self,
+        team_id: int,
+        *,
+        status: str | None = None,
+        limit: int = 50,
+    ) -> list[Match]:
+        stmt = (
+            select(Match)
+            .where(
+                or_(
+                    Match.home_team_id == team_id,
+                    Match.away_team_id == team_id,
+                )
+            )
+            .order_by(Match.utc_date.desc())
+        )
+        if status is not None:
+            stmt = stmt.where(Match.status == status)
+        stmt = stmt.limit(limit)
+        return list(self.db.scalars(stmt).all())
+
     def distinct_league_ids_for_team(
         self,
         team_id: int,
