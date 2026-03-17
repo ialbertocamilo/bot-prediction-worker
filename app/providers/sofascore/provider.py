@@ -100,6 +100,8 @@ class SofaScoreProvider(BaseProvider):
                 "id": str(event["id"]),
                 "home_team": event.get("homeTeam", {}).get("name", ""),
                 "away_team": event.get("awayTeam", {}).get("name", ""),
+                "home_goals": event.get("homeScore", {}).get("current"),
+                "away_goals": event.get("awayScore", {}).get("current"),
             })
         return result
 
@@ -125,6 +127,8 @@ class SofaScoreProvider(BaseProvider):
                 "id": str(event["id"]),
                 "home_team": event.get("homeTeam", {}).get("name", ""),
                 "away_team": event.get("awayTeam", {}).get("name", ""),
+                "home_goals": event.get("homeScore", {}).get("current"),
+                "away_goals": event.get("awayScore", {}).get("current"),
             })
         return result
 

@@ -220,6 +220,7 @@ class HyperparameterOptimizationService:
                 time_decay=td,
                 xg_weight=xg_w,
                 home_adv_init=ha,
+                home_adv_fixed=True,
             )
             bt_report = bt.run()
             elapsed = time.monotonic() - t0

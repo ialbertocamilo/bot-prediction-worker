@@ -96,15 +96,17 @@ class FlatStakeStrategy(StakeStrategy):
 class KellyStakeStrategy(StakeStrategy):
     """Fractional Kelly criterion staking.
 
-    stake = fraction * bankroll * edge / (odds - 1)
+    f* = (p * (O-1) - (1-p)) / (O-1)
+    stake = fraction * f* * bankroll,  capped at max_pct * bankroll.
 
-    Use fraction < 1.0 (e.g. 0.25) for quarter-Kelly to reduce variance.
-    Not activated by default — pass explicitly to the simulator.
+    Use fraction < 1.0 (e.g. 0.10) to reduce variance.
+    Defaults are read from config.KELLY_FRACTION / config.MAX_STAKE_PERCENT.
     """
 
-    def __init__(self, fraction: float = 0.25, max_pct: float = 0.05) -> None:
-        self.fraction = fraction
-        self.max_pct = max_pct  # cap at 5% bankroll per bet
+    def __init__(self, fraction: float | None = None, max_pct: float | None = None) -> None:
+        from config import KELLY_FRACTION, MAX_STAKE_PERCENT
+        self.fraction = fraction if fraction is not None else KELLY_FRACTION
+        self.max_pct = max_pct if max_pct is not None else MAX_STAKE_PERCENT
 
     def compute_stake(
         self,

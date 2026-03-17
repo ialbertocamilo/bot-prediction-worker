@@ -115,11 +115,19 @@ class PredictionService:
         # backtesting/rolling retrain).  Fall back to now for safety.
         ref_ts = match.utc_date or datetime.now(timezone.utc)
 
-        training = self._training_matches(match.league_id, match.id, before_date=ref_ts)
+        # ── Resolve sibling league_ids (season-split fix) ─────────────────
+        # match_league_key is already resolved above (line ~95).  Use it to
+        # fetch ALL league_ids that belong to the same canonical competition
+        # so training data spans across season boundaries.
+        sibling_ids = self._resolve_league_ids_for_key(match_league_key)
+        if not sibling_ids:
+            sibling_ids = [match.league_id]
+
+        training = self._training_matches_multi(sibling_ids, match.id, before_date=ref_ts)
         if len(training) < MIN_MATCHES:
             return None
 
-        td, xg_w, ha = self._league_params(match.league_id)
+        td, xg_w, ha = self._league_params(sibling_ids[0])
         xg_map = self._load_xg_map([m.id for m in training])
 
         from app.services.prediction.training_data import build_training_data

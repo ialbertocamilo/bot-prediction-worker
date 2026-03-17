@@ -111,9 +111,15 @@ def _neg_log_likelihood(
     return -np.sum(ll) + penalty + penalty_xg
 
 class DixonColesModel:
-    def __init__(self, time_decay: float = 0.005, home_adv_init: float | None = None) -> None:
+    def __init__(
+        self,
+        time_decay: float = 0.005,
+        home_adv_init: float | None = None,
+        home_adv_fixed: bool = False,
+    ) -> None:
         self.time_decay = time_decay
         self.home_adv_init = home_adv_init if home_adv_init is not None else _DEFAULT_HOME_ADV_INIT
+        self.home_adv_fixed = home_adv_fixed
         self.params: DixonColesParams | None = None
 
     def fit(
@@ -171,7 +177,11 @@ class DixonColesModel:
         x0[2 * n + 1] = -0.05 
 
         bounds = [(None, None)] * (2 * n)
-        bounds.append((0.0, 1.5))  # home advantage: non-negative, capped
+        if self.home_adv_fixed:
+            # Pin home advantage — optimizer cannot change it.
+            bounds.append((self.home_adv_init, self.home_adv_init))
+        else:
+            bounds.append((0.0, 1.5))  # home advantage: non-negative, capped
         bounds.append((-0.99, 0.99))  
 
         res = minimize(

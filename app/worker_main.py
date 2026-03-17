@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 import threading
+import unicodedata
 from datetime import date, datetime, timedelta, timezone
 from difflib import SequenceMatcher
 
@@ -132,12 +134,232 @@ def sync_players() -> None:
 
 # ── sync match stats ─────────────────────────────────────────────────────
 
-def _match_team_name(name_a: str, name_b: str) -> bool:
-    """Fuzzy match team names (exact first, then ratio > 0.8)."""
-    a, b = name_a.lower().strip(), name_b.lower().strip()
-    if a == b:
-        return True
-    return SequenceMatcher(None, a, b).ratio() > 0.8
+# ── Team name matching (ESPN ↔ SofaScore) ────────────────────────────────
+
+# Noise words stripped before comparison — differ between providers
+_TEAM_NOISE = frozenset({
+    "fc", "cf", "sc", "cd", "ac", "as", "us", "ss", "rcd", "afc", "bsc",
+    "fk", "sk", "nk", "pk", "sv", "tsv", "vfl", "vfb",
+    "de", "del", "fsv", "tsg", "1.", "1899", "1848", "1860",
+    "04", "05", "09",
+})
+
+# ── Entity-resolution alias dictionary ───────────────────────────────────
+# Maps normalized team names → canonical form so different sources
+# (ESPN, SofaScore, etc.) resolve to the same entity.
+# Keys MUST be the output of _normalize_team().
+TEAM_NAME_ALIASES: dict[str, str] = {
+    # ── Italy / Serie A ──
+    "internazionale": "inter milan",
+    "inter": "inter milan",
+    "fc internazionale milano": "inter milan",
+    "fc inter milano": "inter milan",
+    # ── MLS (prevent Inter Miami ↔ Inter Milan cross-match) ──
+    "inter miami cf": "inter miami",
+    "inter miami": "inter miami",
+    "cf montreal": "cf montreal",
+    "lafc": "los angeles fc",
+    "la fc": "los angeles fc",
+    "los angeles fc": "los angeles fc",
+    "houston dynamo fc": "houston dynamo",
+    "houston dynamo": "houston dynamo",
+    "new england revolution": "new england revolution",
+    # ── Germany / Bundesliga ──
+    "fc cologne": "koln",
+    "cologne": "koln",
+    "1 fc koln": "koln",
+    "fc koln": "koln",
+    "fc augsburg": "augsburg",
+    # ── Belgium / Europa League ──
+    "racing genk": "genk",
+    "krc genk": "genk",
+    # ── Serbia / Champions / Europa ──
+    "red star belgrade": "crvena zvezda",
+    "fk crvena zvezda": "crvena zvezda",
+    "crvena zvezda": "crvena zvezda",
+    # ── France ──
+    "paris saint germain": "psg",
+    "paris saint-germain": "psg",
+    "paris sg": "psg",
+    "psg": "psg",
+    # ── Norway / Champions ──
+    "bodo/glimt": "bodo glimt",
+    "bodo glimt": "bodo glimt",
+    "fk bodo glimt": "bodo glimt",
+    "fk bodoglimt": "bodo glimt",
+    # ── Croatia / Europa ──
+    "dinamo zagreb": "dinamo zagreb",
+    "gnk dinamo zagreb": "dinamo zagreb",
+    # ── Argentina / Primera División ──
+    "racing club": "racing club arg",
+    "racing": "racing club arg",
+    "club atletico independiente": "independiente arg",
+    "independiente": "independiente arg",
+    "ca independiente": "independiente arg",
+    # ── Ecuador (prevent Independiente del Valle ↔ Independiente ARG) ──
+    "independiente del valle": "independiente del valle",
+    # ── Peru ──
+    "adt": "adt de tarma",
+    "asociacion deportiva tarma": "adt de tarma",
+    "utc": "utc cajamarca",
+    "universidad tecnica de cajamarca": "utc cajamarca",
+    "juan pablo ii": "juan pablo ii",
+    # ── Libertadores / South America ──
+    "atletico mineiro": "atletico mineiro",
+    "atletico mg": "atletico mineiro",
+    "atletico madrid": "atletico madrid",
+    "atletico de madrid": "atletico madrid",
+    "club atletico de madrid": "atletico madrid",
+}
+
+
+def _strip_accents(s: str) -> str:
+    nfkd = unicodedata.normalize("NFKD", s)
+    base = "".join(c for c in nfkd if not unicodedata.combining(c))
+    # Characters that NFKD doesn't decompose into base + combining
+    return base.translate(str.maketrans({"ø": "o", "Ø": "O", "ð": "d", "ł": "l", "æ": "ae", "ß": "ss"}))
+
+
+def _normalize_team(name: str) -> str:
+    name = _strip_accents(name.lower().strip())
+    name = re.sub(r"[.\-'\"()/]", " ", name)
+    return re.sub(r"\s+", " ", name).strip()
+
+
+def _resolve_alias(name: str) -> str:
+    """Resolve a team name via the alias dictionary.
+
+    Returns the canonical form if found, otherwise the normalized name.
+    """
+    normalized = _normalize_team(name)
+    return TEAM_NAME_ALIASES.get(normalized, normalized)
+
+
+def _core_tokens(name: str) -> set[str]:
+    tokens = set(_normalize_team(name).split())
+    meaningful = {t for t in tokens if t not in _TEAM_NOISE and not t.isdigit()}
+    return meaningful if meaningful else tokens
+
+
+def _team_name_score(name_a: str, name_b: str) -> float:
+    """Return a similarity score [0.0, 1.0] between two team names.
+
+    Resolves aliases first, then uses layered heuristics:
+    alias → exact → word-boundary → token overlap → fuzzy.
+    Does NOT make any match/no-match decision — callers decide the threshold.
+    """
+    # Resolve through alias dictionary before any comparison
+    na = _resolve_alias(name_a)
+    nb = _resolve_alias(name_b)
+
+    if na == nb:
+        return 1.0
+
+    # Word-boundary containment
+    if len(na) >= 4 and len(nb) >= 4:
+        shorter, longer = (na, nb) if len(na) <= len(nb) else (nb, na)
+        if re.search(r"\b" + re.escape(shorter) + r"\b", longer):
+            return 0.90
+
+    # Token-level fuzzy match (from resolved names)
+    ta = _core_tokens(na)
+    tb = _core_tokens(nb)
+    if ta and tb:
+        smaller, larger = (ta, tb) if len(ta) <= len(tb) else (tb, ta)
+        matched = 0
+        for s in smaller:
+            for l in larger:
+                if s == l or (
+                    len(s) >= 4
+                    and len(l) >= 4
+                    and SequenceMatcher(None, s, l).ratio() > 0.65
+                ):
+                    matched += 1
+                    break
+        ratio = matched / len(smaller)
+        if ratio > 0:
+            return 0.5 + 0.4 * ratio  # maps (0,1] → (0.5, 0.9]
+
+    # Raw sequence similarity on normalized name (last resort)
+    return SequenceMatcher(None, na, nb).ratio()
+
+
+# Minimum name score to even consider a pair (low on purpose — score
+# verification does the real filtering).
+_NAME_THRESHOLD = 0.45
+
+
+def _find_best_match(
+    db_match: Match,
+    db_home: str,
+    db_away: str,
+    events: list[dict],
+    used_event_ids: set[str],
+) -> dict | None:
+    """Find the SofaScore event that best matches a DB match.
+
+    Strategy (in order):
+      1. Name similarity must be above _NAME_THRESHOLD for BOTH teams.
+      2. Among candidates, prefer those where the **score matches exactly**.
+      3. If multiple score-verified candidates, pick highest name score.
+      4. Never return an event already assigned to another DB match.
+      5. Minimum per-team name score: 0.75 (score-verified), 0.45 (candidate).
+    """
+    db_hg = db_match.home_goals
+    db_ag = db_match.away_goals
+
+    best: dict | None = None
+    best_score: float = 0.0
+    best_score_verified: bool = False
+    best_h: float = 0.0
+    best_a: float = 0.0
+
+    for ev in events:
+        eid = ev["id"]
+        if eid in used_event_ids:
+            continue
+
+        h_score = _team_name_score(ev.get("home_team", ""), db_home)
+        a_score = _team_name_score(ev.get("away_team", ""), db_away)
+
+        if h_score < _NAME_THRESHOLD or a_score < _NAME_THRESHOLD:
+            continue
+
+        combined = (h_score + a_score) / 2
+
+        # Score verification: goals from SofaScore must match DB
+        score_ok = (
+            db_hg is not None
+            and ev.get("home_goals") is not None
+            and db_hg == ev["home_goals"]
+            and db_ag == ev.get("away_goals")
+        )
+
+        # Score-verified candidate always beats non-verified
+        if score_ok and not best_score_verified:
+            best, best_score, best_score_verified = ev, combined, True
+            best_h, best_a = h_score, a_score
+        elif score_ok and best_score_verified and combined > best_score:
+            best, best_score = ev, combined
+            best_h, best_a = h_score, a_score
+        elif not score_ok and not best_score_verified and combined > best_score:
+            best, best_score = ev, combined
+            best_h, best_a = h_score, a_score
+
+    if best is None:
+        return None
+
+    # Non-verified: combined name must be very high
+    if not best_score_verified and best_score < 0.85:
+        return None
+
+    # Score-verified: each team name must still be reasonably close.
+    # This blocks e.g. "Manchester City" (0.70) matching "Manchester United"
+    # even when the score happens to coincide.
+    if best_score_verified and min(best_h, best_a) < 0.75:
+        return None
+
+    return best
 
 
 def sync_match_stats() -> None:
@@ -191,11 +413,13 @@ def sync_match_stats() -> None:
 
         matches_by_date: dict[date, list[int]] = defaultdict(list)
         match_dates: dict[int, date] = {}
+        match_lookup: dict[int, Match] = {}
         for m in needing_stats:
             if m.utc_date:
                 d = m.utc_date.date() if hasattr(m.utc_date, 'date') else m.utc_date
                 matches_by_date[d].append(m.id)
                 match_dates[m.id] = d
+                match_lookup[m.id] = m
 
         unique_dates = sorted(matches_by_date.keys(), reverse=True)
         logger.info("Stats sync: %d unique dates to query", len(unique_dates))
@@ -205,54 +429,60 @@ def sync_match_stats() -> None:
 
         if has_get_events_for_date:
             # Date-based lookup (works for ALL leagues, no tournament/season ID needed)
+            skipped_dates = 0
             for target_date in unique_dates:
                 if not pending:
                     break
 
-                finished_events = stats_provider.get_events_for_date(target_date)
+                try:
+                    finished_events = stats_provider.get_events_for_date(target_date)
+                except Exception:
+                    logger.warning("Stats date %s failed (503/timeout), skipping", target_date)
+                    skipped_dates += 1
+                    continue
                 if not finished_events:
                     continue
 
-                for event in finished_events:
-                    if not pending:
-                        break
+                # For each DB match on this date, find best SofaScore event
+                used_event_ids: set[str] = set()
+                for mid in matches_by_date[target_date]:
+                    if mid not in pending:
+                        continue
+                    db_home, db_away = pending[mid]
+                    db_m = match_lookup[mid]
+
+                    event = _find_best_match(
+                        db_m, db_home, db_away,
+                        finished_events, used_event_ids,
+                    )
+                    if event is None:
+                        continue
 
                     event_id = event["id"]
-                    sc_home = event.get("home_team", "")
-                    sc_away = event.get("away_team", "")
-
-                    matched_id: int | None = None
-                    for mid in matches_by_date[target_date]:
-                        if mid not in pending:
-                            continue
-                        db_home, db_away = pending[mid]
-                        if _match_team_name(sc_home, db_home) and _match_team_name(sc_away, db_away):
-                            matched_id = mid
-                            break
-
-                    if matched_id is None:
-                        continue
+                    used_event_ids.add(event_id)
 
                     try:
                         stats_list = stats_provider.get_match_stats(event_id)
                     except Exception:
                         logger.warning("Stats fetch failed for event %s, skipping", event_id)
-                        pending.pop(matched_id, None)
+                        pending.pop(mid, None)
                         continue
                     if not stats_list:
-                        pending.pop(matched_id, None)
+                        pending.pop(mid, None)
                         continue
 
                     ids = stats_svc.ingest_match_stats(
                         stats_list,
-                        source_match_id_to_db_id={event_id: matched_id},
+                        source_match_id_to_db_id={event_id: mid},
                     )
                     ingested += len(ids)
-                    pending.pop(matched_id, None)
+                    pending.pop(mid, None)
 
                     logger.info(
                         "Stats event %s → match %d (%s vs %s): %d registros",
-                        event_id, matched_id, sc_home, sc_away, len(ids),
+                        event_id, mid,
+                        event.get("home_team", ""), event.get("away_team", ""),
+                        len(ids),
                     )
 
                     # Commit every 50 matches so progress isn't lost
@@ -262,43 +492,51 @@ def sync_match_stats() -> None:
             # Fallback: tournament-based pagination (legacy)
             max_pages = int(os.getenv("STATS_MAX_PAGES", "40"))
             page = 0
+            all_legacy_events: list[dict] = []
             while page < max_pages and pending:
                 finished_events = stats_provider.get_finished_events_page(page=page)
                 if not finished_events:
                     break
-                for event in finished_events:
-                    if not pending:
-                        break
-                    event_id = event["id"]
-                    sc_home = event.get("home_team", "")
-                    sc_away = event.get("away_team", "")
-                    matched_id = None
-                    for mid, (db_home, db_away) in pending.items():
-                        if _match_team_name(sc_home, db_home) and _match_team_name(sc_away, db_away):
-                            matched_id = mid
-                            break
-                    if matched_id is None:
-                        continue
-                    stats_list = stats_provider.get_match_stats(event_id)
-                    if not stats_list:
-                        pending.pop(matched_id, None)
-                        continue
-                    ids = stats_svc.ingest_match_stats(
-                        stats_list,
-                        source_match_id_to_db_id={event_id: matched_id},
-                    )
-                    ingested += len(ids)
-                    pending.pop(matched_id, None)
-                    logger.info(
-                        "Stats event %s → match %d (%s vs %s): %d registros",
-                        event_id, matched_id, sc_home, sc_away, len(ids),
-                    )
+                all_legacy_events.extend(finished_events)
                 if len(finished_events) < 20:
                     break
                 page += 1
 
+            used_event_ids_legacy: set[str] = set()
+            for mid in list(pending.keys()):
+                db_home, db_away = pending[mid]
+                db_m = match_lookup.get(mid)
+                if db_m is None:
+                    continue
+                event = _find_best_match(
+                    db_m, db_home, db_away,
+                    all_legacy_events, used_event_ids_legacy,
+                )
+                if event is None:
+                    continue
+                event_id = event["id"]
+                used_event_ids_legacy.add(event_id)
+                stats_list = stats_provider.get_match_stats(event_id)
+                if not stats_list:
+                    pending.pop(mid, None)
+                    continue
+                ids = stats_svc.ingest_match_stats(
+                    stats_list,
+                    source_match_id_to_db_id={event_id: mid},
+                )
+                ingested += len(ids)
+                pending.pop(mid, None)
+                logger.info(
+                    "Stats event %s → match %d (%s vs %s): %d registros",
+                    event_id, mid,
+                    event.get("home_team", ""), event.get("away_team", ""),
+                    len(ids),
+                )
+
         db.commit()
         logger.info("Total stats ingresados: %d registros", ingested)
+        if has_get_events_for_date and skipped_dates:
+            logger.warning("Fechas omitidas por error (503/timeout): %d — relanzar sync para reintentar", skipped_dates)
     except Exception:
         db.rollback()
         raise
@@ -407,30 +645,31 @@ def backfill_stats() -> None:
             home_name = m.home_team.name if m.home_team else "Unknown"
             away_name = m.away_team.name if m.away_team else "Unknown"
 
-            # Try to get stats by iterating provider events (match by name)
+            # Try to get stats by iterating provider events (match by name + score)
             events_page = 0
             found = False
-            while events_page < 5 and not found:
+            all_events: list[dict] = []
+            while events_page < 5:
                 events = stats_provider.get_finished_events_page(page=events_page)
                 if not events:
                     break
-                for event in events:
-                    if (_match_team_name(event.get("home_team", ""), home_name)
-                            and _match_team_name(event.get("away_team", ""), away_name)):
-                        stats_list = stats_provider.get_match_stats(event["id"])
-                        if stats_list:
-                            ids = stats_svc.ingest_match_stats(
-                                stats_list,
-                                source_match_id_to_db_id={event["id"]: m.id},
-                            )
-                            ingested += len(ids)
-                            logger.info(
-                                "Backfill: match %d (%s vs %s) → %d stats",
-                                m.id, home_name, away_name, len(ids),
-                            )
-                        found = True
-                        break
+                all_events.extend(events)
                 events_page += 1
+
+            used: set[str] = set()
+            event = _find_best_match(m, home_name, away_name, all_events, used)
+            if event is not None:
+                stats_list = stats_provider.get_match_stats(event["id"])
+                if stats_list:
+                    ids = stats_svc.ingest_match_stats(
+                        stats_list,
+                        source_match_id_to_db_id={event["id"]: m.id},
+                    )
+                    ingested += len(ids)
+                    logger.info(
+                        "Backfill: match %d (%s vs %s) → %d stats",
+                        m.id, home_name, away_name, len(ids),
+                    )
 
         db.commit()
 

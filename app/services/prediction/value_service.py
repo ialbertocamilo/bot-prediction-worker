@@ -96,6 +96,55 @@ def compute_edge(
     return edges
 
 
+def compute_kelly_stake(
+    p_model: float,
+    odds: float,
+    kelly_fraction: float | None = None,
+    max_stake_pct: float | None = None,
+) -> dict[str, float]:
+    """Compute recommended stake % using fractional Kelly criterion.
+
+    Formula (traditional Kelly):
+        f* = (p * (O - 1) - (1 - p)) / (O - 1)
+    where p = model probability and O = decimal odds.
+
+    Returns dict with:
+        kelly_raw       – full (uncapped) Kelly fraction
+        recommended_stake_percent – fraction * kelly * capped to max_stake_pct
+        edge            – additive edge = p * O - 1  (>0 → positive EV)
+
+    If edge <= 0 the recommended stake is always 0.
+    """
+    from config import KELLY_FRACTION, MAX_STAKE_PERCENT
+
+    if kelly_fraction is None:
+        kelly_fraction = KELLY_FRACTION
+    if max_stake_pct is None:
+        max_stake_pct = MAX_STAKE_PERCENT
+
+    b = odds - 1.0
+    edge = p_model * odds - 1.0  # additive edge
+
+    if edge <= 0 or b <= 0:
+        return {
+            "kelly_raw": 0.0,
+            "recommended_stake_percent": 0.0,
+            "edge": round(edge, 6),
+        }
+
+    kelly_f = (b * p_model - (1.0 - p_model)) / b  # = (p*O - 1) / (O - 1)
+    kelly_f = max(kelly_f, 0.0)
+
+    stake_pct = kelly_f * kelly_fraction
+    stake_pct = min(stake_pct, max_stake_pct)
+
+    return {
+        "kelly_raw": round(kelly_f, 6),
+        "recommended_stake_percent": round(stake_pct, 6),
+        "edge": round(edge, 6),
+    }
+
+
 class ValueService:
     """Compares model predictions against market odds to find value."""
 

@@ -11,7 +11,7 @@ from app.repositories.prediction.market_odds_repository import MarketOddsReposit
 from app.repositories.prediction.model_repository import ModelRepository
 from app.repositories.prediction.prediction_repository import PredictionRepository
 from app.services.prediction.prediction_service import PredictionService
-from app.services.prediction.value_service import ValueService, odds_to_probs, compute_edge
+from app.services.prediction.value_service import ValueService, odds_to_probs, compute_edge, compute_kelly_stake
 
 router = APIRouter()
 
@@ -43,19 +43,19 @@ def _value_analysis(p_home: float, p_draw: float, p_away: float,
         ("away", p_away, odds_away, "edge_away"),
     ]:
         p_market = market_probs.get(f"p_{label}", 0.0)
-        edge = edges[edge_key]
-        b = odd - 1.0
-        kelly_f = max((b * prob - (1.0 - prob)) / b, 0.0) if b > 0 else 0.0
+        mult_edge = edges[edge_key]  # multiplicative edge (P_model/P_market - 1)
+        ks = compute_kelly_stake(prob, odd)  # centralised Kelly + risk caps
         markets.append({
             "market": label,
             "bookmaker_odds": odd,
             "model_prob": round(prob, 4),
             "implied_prob": round(p_market, 4),
-            "edge": round(edge, 4),
-            "ev": round(edge, 4),
-            "kelly_fraction": round(kelly_f, 4),
-            "kelly_quarter": round(kelly_f * 0.25, 4),
-            "is_value": edge > 0,
+            "edge": round(mult_edge, 4),
+            "edge_additive": round(ks["edge"], 4),
+            "ev": round(mult_edge, 4),
+            "kelly_raw": round(ks["kelly_raw"], 4),
+            "recommended_stake_percent": round(ks["recommended_stake_percent"], 4),
+            "is_value": mult_edge > 0,
         })
     return {
         "value_bets": [m for m in markets if m["is_value"]],
@@ -137,6 +137,21 @@ def upcoming(
                 model_p = {"p_home": pred.p_home, "p_draw": pred.p_draw, "p_away": pred.p_away}
                 item["edge"] = compute_edge(model_p, mkt)
 
+                # Kelly stake recommendation per outcome
+                stakes = {}
+                for label, prob, odd in [
+                    ("home", pred.p_home, consensus["home_odds"]),
+                    ("draw", pred.p_draw, consensus["draw_odds"]),
+                    ("away", pred.p_away, consensus["away_odds"]),
+                ]:
+                    ks = compute_kelly_stake(prob, odd)
+                    stakes[label] = {
+                        "recommended_stake_percent": round(ks["recommended_stake_percent"], 4),
+                        "kelly_raw": round(ks["kelly_raw"], 4),
+                        "edge_additive": round(ks["edge"], 4),
+                    }
+                item["recommended_stakes"] = stakes
+
         items.append(item)
 
     return {"count": len(items), "matches": items}
@@ -190,10 +205,27 @@ def predict(
         response["market_odds"] = stored_value["market_odds"]
         response["market_probabilities"] = stored_value["market_probabilities"]
         response["edge"] = stored_value["edge"]
+
+        # Kelly stake recommendation per outcome
+        mo = stored_value["market_odds"]
+        stakes = {}
+        for label, prob, odd in [
+            ("home", result.p_home, mo["home"]),
+            ("draw", result.p_draw, mo["draw"]),
+            ("away", result.p_away, mo["away"]),
+        ]:
+            ks = compute_kelly_stake(prob, odd)
+            stakes[label] = {
+                "recommended_stake_percent": round(ks["recommended_stake_percent"], 4),
+                "kelly_raw": round(ks["kelly_raw"], 4),
+                "edge_additive": round(ks["edge"], 4),
+            }
+        response["recommended_stakes"] = stakes
     else:
         response.setdefault("market_odds", None)
         response.setdefault("market_probabilities", None)
         response.setdefault("edge", None)
+        response.setdefault("recommended_stakes", None)
 
     return response
 

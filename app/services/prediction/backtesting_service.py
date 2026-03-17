@@ -92,12 +92,14 @@ class BacktestingService:
         time_decay: float | None = None,
         xg_weight: float | None = None,
         home_adv_init: float | None = None,
+        home_adv_fixed: bool = False,
     ) -> None:
         self.db = db
         self.league_id = league_id
         self._time_decay = time_decay if time_decay is not None else TIME_DECAY
         self._xg_weight = xg_weight if xg_weight is not None else XG_REG_WEIGHT
         self._home_adv_init = home_adv_init if home_adv_init is not None else HOME_ADVANTAGE
+        self._home_adv_fixed = home_adv_fixed
 
     def run(self) -> BacktestReport:
         """Execute walk-forward backtest and return metrics."""
@@ -136,7 +138,11 @@ class BacktestingService:
                 continue
 
             # Fit and predict
-            dc = DixonColesModel(time_decay=self._time_decay, home_adv_init=self._home_adv_init)
+            dc = DixonColesModel(
+                time_decay=self._time_decay,
+                home_adv_init=self._home_adv_init,
+                home_adv_fixed=self._home_adv_fixed,
+            )
             try:
                 params = dc.fit(match_data, xg_priors=xg_priors, xg_weight=self._xg_weight)
             except ValueError:
