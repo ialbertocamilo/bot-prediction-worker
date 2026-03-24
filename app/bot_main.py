@@ -2,16 +2,21 @@
 Bot de Telegram — lee datos de la DB, predice con Dixon-Coles.
 
 Comandos:
-    /start              — Bienvenida y ayuda
+    /start              — Bienvenida interactiva con menú inline
+    /help               — Ayuda detallada con leyenda de métricas
     /leagues            — Listar ligas disponibles (canónicas, deduplicadas)
     /matches [liga]     — Próximos partidos (opcionalmente filtrar por liga canónica)
     /predict <número>   — Predicción completa del partido seleccionado
     /valuebets          — Top value bets actuales
 
-Mejoras v2:
+Mejoras v3 – UX overhaul:
+    - Onboarding profesional con InlineKeyboardMarkup
+    - /help con leyenda de métricas (Edge, Kelly, confianza)
+    - Predicción formateada con secciones claras y leyenda
+    - Callback queries para navegación inline (ligas, matches hoy)
+    - MessageHandler fallback para texto libre → menú principal
     - Resiliencia: try/except por comando con NetworkError/TimedOut handling
     - Alerta diaria: scheduler envía top value bets al admin
-    - Formateo profesional: emojis, bloques HTML, info limpia
     - Anti-spam: sleep entre envíos masivos
 """
 from __future__ import annotations
@@ -23,9 +28,16 @@ import time
 
 from dotenv import load_dotenv
 from sqlalchemy.orm import Session
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import NetworkError, RetryAfter, TimedOut
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 from app.db.models.football.match import Match
 from app.db.session import SessionLocal
@@ -129,39 +141,130 @@ async def _safe_send(bot, chat_id: int | str, text: str, **kwargs) -> None:
         logger.exception("Telegram NetworkError — message not delivered to %s", chat_id)
 
 
+# ── Inline keyboard helpers ───────────────────────────────────────────────
+
+def _main_menu_keyboard() -> InlineKeyboardMarkup:
+    """Return the persistent main-menu inline keyboard."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🏆 Ligas", callback_data="menu_leagues"),
+            InlineKeyboardButton("📅 Partidos de hoy", callback_data="menu_matches"),
+        ],
+        [
+            InlineKeyboardButton("📈 Value Bets", callback_data="menu_valuebets"),
+            InlineKeyboardButton("❓ Ayuda", callback_data="menu_help"),
+        ],
+    ])
+
+
 # ── /start ────────────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     name = _esc(user.first_name or "Usuario")
     msg = (
-        f"👋 ¡Hola <b>{name}</b>!\n\n"
-        "Soy tu bot de predicciones de fútbol con modelo Dixon-Coles.\n\n"
-        "📋 <b>Comandos:</b>\n"
-        "  /leagues  — 🏟️ Ligas disponibles\n"
-        "  /matches  — ⚽ Próximos partidos\n"
-        "  /matches &lt;num&gt;  — Partidos de una liga\n"
-        "  /predict &lt;num&gt;  — 🔮 Predicción del partido\n"
-        "  /valuebets  — 📈 Top value bets\n\n"
-        "<i>Ejemplo: /leagues → /matches 1 → /predict 1</i>"
+        f"👋 <b>¡Hola {name}!</b>\n\n"
+        "Soy <b>FútbolQuant</b> — tu asistente de predicciones de fútbol "
+        "basado en el modelo estadístico <b>Dixon-Coles</b>.\n\n"
+        "🧠 <b>¿Cómo funciono?</b>\n"
+        "Analizo miles de partidos históricos para calcular "
+        "<b>probabilidades matemáticas</b> de cada resultado (1X2, O/U, BTTS). "
+        "Luego las comparo con las <b>cuotas del mercado</b> para detectar "
+        "apuestas con ventaja estadística (<i>value bets</i>).\n\n"
+        "📋 <b>Empieza aquí:</b>"
     )
-    await _safe_reply(update, msg, parse_mode="HTML")
+    await _safe_reply(update, msg, parse_mode="HTML", reply_markup=_main_menu_keyboard())
+
+
+# ── /help ─────────────────────────────────────────────────────────────────
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = (
+        "📖 <b>Guía Rápida</b>\n\n"
+        "<b>Flujo recomendado:</b>\n"
+        "  1️⃣ /leagues → ver ligas disponibles\n"
+        "  2️⃣ /matches &lt;num&gt; → partidos de esa liga\n"
+        "  3️⃣ /predict &lt;num&gt; → predicción completa\n"
+        "  4️⃣ /valuebets → mejores apuestas de valor\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "📊 <b>Leyenda de métricas:</b>\n\n"
+        "🔮 <b>Confianza</b> — Probabilidad del modelo para el resultado más probable.\n"
+        "    🟢 Alta (≥70%)  🟡 Media (50-69%)  🟠 Baja (35-49%)  🔴 Muy baja (&lt;35%)\n\n"
+        "📈 <b>Edge</b> — Ventaja del modelo sobre las cuotas del mercado.\n"
+        "    Si el modelo dice 50% y la casa 40%, el edge es +25%.\n"
+        "    Edge ≥ 5% = oportunidad interesante.\n\n"
+        "💰 <b>Stake (Kelly)</b> — % recomendado del bankroll según el Criterio de Kelly.\n"
+        "    Se usa Kelly fraccionado (10%) con tope del 5% del bankroll.\n"
+        "    🟢🟢🟢⚪⚪⚪⚪⚪⚪⚪ = 3/10 (conservador)\n"
+        "    🟢🟢🟢🟢🟢🟢🟢🟢⚪⚪ = 8/10 (agresivo)\n\n"
+        "📈 <b>xG</b> — Goles esperados: estima cuántos goles debería anotar cada equipo.\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "<i>Desarrollado con Dixon-Coles (1997) + calibración Platt + datos de 18 ligas.</i>"
+    )
+    await _safe_reply(update, msg, parse_mode="HTML", reply_markup=_main_menu_keyboard())
+
+
+# ── Callback query handler (inline buttons) ──────────────────────────────
+
+async def _callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Route inline-keyboard button presses to the right command."""
+    query = update.callback_query
+    await query.answer()  # Acknowledge immediately to stop loading spinner
+
+    data = query.data or ""
+    if data == "menu_leagues":
+        await _do_leagues(query.message, context)
+    elif data == "menu_matches":
+        await _do_matches(query.message, context, canonical_index=None)
+    elif data == "menu_valuebets":
+        await _do_valuebets(query.message, context)
+    elif data == "menu_help":
+        msg = (
+            "📖 <b>Guía Rápida</b>\n\n"
+            "<b>Flujo:</b> /leagues → /matches &lt;num&gt; → /predict &lt;num&gt;\n\n"
+            "📈 <b>Edge</b> = ventaja sobre el mercado\n"
+            "💰 <b>Stake</b> = % del bankroll (Kelly fraccionado)\n"
+            "🟢 Alta confianza · 🟡 Media · 🟠 Baja · 🔴 Muy baja"
+        )
+        await _safe_edit_or_send(query.message, msg, parse_mode="HTML", reply_markup=_main_menu_keyboard())
+    elif data.startswith("league_"):
+        idx = int(data.split("_", 1)[1])
+        await _do_matches(query.message, context, canonical_index=idx)
+
+
+async def _safe_edit_or_send(message, text: str, **kwargs) -> None:
+    """Try to edit the existing message; fall back to sending a new one."""
+    try:
+        await message.edit_text(text, **kwargs)
+    except Exception:
+        try:
+            await message.reply_text(text, **kwargs)
+        except Exception:
+            logger.exception("Failed to edit or send message")
 
 
 # ── /leagues ──────────────────────────────────────────────────────────────
 
 async def cmd_leagues(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """List canonical (deduplicated) leagues."""
+    await _do_leagues(update.message, context)
+
+
+async def _do_leagues(message, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Shared logic for /leagues command and inline button."""
     db = _db()
     try:
         svc = CanonicalLeagueService(db)
         leagues = svc.list_leagues()
 
         if not leagues:
-            await _safe_reply(update, "⚠️ No hay ligas registradas en la DB.")
+            await _safe_edit_or_send(message, "⚠️ No hay ligas registradas en la DB.")
             return
 
-        lines = ["🏟️ <b>Ligas disponibles</b>\n"]
+        lines = ["🏆 <b>Ligas disponibles</b>\n"]
+        keyboard_rows: list[list[InlineKeyboardButton]] = []
+        row: list[InlineKeyboardButton] = []
+
         for lg in leagues:
             country = f" ({_esc(lg.country)})" if lg.country else ""
             status = "✅" if lg.scheduled_matches > 0 else "⏸️"
@@ -170,15 +273,29 @@ async def cmd_leagues(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 f"       {lg.finished_matches} jugados · {lg.scheduled_matches} programados"
             )
 
-        lines.append(
-            "\n<i>Usa /matches &lt;num&gt; para ver partidos.\n"
-            "Ejemplo: /matches 1</i>"
-        )
+            # Build inline keyboard: 2 buttons per row
+            btn = InlineKeyboardButton(
+                f"{lg.index}. {lg.display_name[:18]}",
+                callback_data=f"league_{lg.index}",
+            )
+            row.append(btn)
+            if len(row) == 2:
+                keyboard_rows.append(row)
+                row = []
 
-        await _safe_reply(update, "\n".join(lines), parse_mode="HTML")
+        if row:
+            keyboard_rows.append(row)
+
+        lines.append("\n<i>Toca una liga o usa /matches &lt;num&gt;</i>")
+        markup = InlineKeyboardMarkup(keyboard_rows) if keyboard_rows else None
+
+        text = "\n".join(lines)
+        if len(text) > 4000:
+            text = text[:3950] + "\n..."
+        await _safe_edit_or_send(message, text, parse_mode="HTML", reply_markup=markup)
     except Exception:
         logger.exception("Error en /leagues")
-        await _safe_reply(update, "⚠️ Error al obtener ligas. Intenta de nuevo.")
+        await _safe_edit_or_send(message, "⚠️ Error al obtener ligas. Intenta de nuevo.")
     finally:
         db.close()
 
@@ -198,6 +315,11 @@ async def cmd_matches(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
             return
 
+    await _do_matches(update.message, context, canonical_index=canonical_index)
+
+
+async def _do_matches(message, context: ContextTypes.DEFAULT_TYPE, *, canonical_index: int | None) -> None:
+    """Shared logic for /matches command and inline buttons."""
     db = _db()
     try:
         svc = CanonicalLeagueService(db)
@@ -206,8 +328,8 @@ async def cmd_matches(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if canonical_index is not None:
             leagues = svc.list_leagues()
             if canonical_index < 1 or canonical_index > len(leagues):
-                await _safe_reply(
-                    update,
+                await _safe_edit_or_send(
+                    message,
                     f"⚠️ Liga fuera de rango. Usa /leagues para ver los números.",
                 )
                 return
@@ -219,13 +341,18 @@ async def cmd_matches(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
         if not upcoming:
             filter_msg = f" para liga {canonical_index}" if canonical_index else ""
-            await _safe_reply(
-                update,
+            back_btn = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🏆 Ver ligas", callback_data="menu_leagues"),
+                InlineKeyboardButton("🏠 Menú", callback_data="menu_help"),
+            ]])
+            await _safe_edit_or_send(
+                message,
                 f"📭 No hay partidos programados{filter_msg}.",
+                reply_markup=back_btn,
             )
             return
 
-        chat_id = update.effective_chat.id
+        chat_id = message.chat_id
         _cache_set(chat_id, upcoming)
 
         filter_label = ""
@@ -260,10 +387,10 @@ async def cmd_matches(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         text = "\n".join(lines)
         if len(text) > 4000:
             text = text[:3950] + "\n..."
-        await _safe_reply(update, text, parse_mode="HTML")
+        await _safe_edit_or_send(message, text, parse_mode="HTML")
     except Exception:
         logger.exception("Error en /matches")
-        await _safe_reply(update, "⚠️ Error al obtener partidos. Intenta de nuevo.")
+        await _safe_edit_or_send(message, "⚠️ Error al obtener partidos. Intenta de nuevo.")
     finally:
         db.close()
 
@@ -348,29 +475,41 @@ def _format_prediction(result) -> str:
         tip, conf = "X (Empate)", p_d
 
     lines = [
+        "━━━━━━━━━━━━━━━━━━━━━",
         f"⚽ <b>{home}  vs  {away}</b>",
         f"🏆 {_esc(result.league or '')}",
     ]
     if result.utc_date:
         lines.append(f"🕐 {result.utc_date.strftime('%d/%m/%Y %H:%M')} UTC")
 
-    lines.append("")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━")
+
+    # ── Main prediction ──
     lines.append(
-        f"🔮 Predicción: <b>{tip}</b>\n"
-        f"    Confianza: <b>{_pct(conf)}</b> — {_confidence_label(conf)}"
+        f"\n🔮 <b>Predicción: {tip}</b>\n"
+        f"    {_confidence_label(conf)}  ({_pct(conf)})"
     )
 
-    # ── 1X2 ──
+    # ── 1X2 visual bar ──
+    bar_h = round(p_h * 20)
+    bar_d = round(p_d * 20)
+    bar_a = 20 - bar_h - bar_d
+    bar_a = max(0, bar_a)
     lines.append(
-        f"\n📊 <b>1X2</b>\n"
-        f"    Local <b>{_pct(p_h)}</b>  ·  Empate <b>{_pct(p_d)}</b>  ·  Visitante <b>{_pct(p_a)}</b>"
+        f"\n📊 <b>Probabilidades 1X2</b>\n"
+        f"    🏠 Local    <b>{_pct(p_h)}</b>  {'▓' * bar_h}{'░' * (20 - bar_h)}\n"
+        f"    🤝 Empate  <b>{_pct(p_d)}</b>  {'▓' * bar_d}{'░' * (20 - bar_d)}\n"
+        f"    ✈️ Visita   <b>{_pct(p_a)}</b>  {'▓' * bar_a}{'░' * (20 - bar_a)}"
     )
 
     # ── xG ──
     xg_h = result.xg_home or 0
     xg_a = result.xg_away or 0
     if xg_h or xg_a:
-        lines.append(f"📈 <b>xG:</b>  {home} <b>{xg_h:.2f}</b> — <b>{xg_a:.2f}</b> {away}")
+        lines.append(
+            f"\n📈 <b>Goles Esperados (xG)</b>\n"
+            f"    {home} <b>{xg_h:.2f}</b>  —  <b>{xg_a:.2f}</b> {away}"
+        )
 
     # ── Over/Under ──
     ou_parts: list[str] = []
@@ -381,18 +520,19 @@ def _format_prediction(result) -> str:
     if result.p_over_3_5 is not None:
         ou_parts.append(f"O3.5 <b>{_pct(result.p_over_3_5)}</b>")
     if ou_parts:
-        lines.append(f"⬆️ <b>Over/Under:</b>  {' · '.join(ou_parts)}")
+        lines.append(f"\n⬆️ <b>Over/Under</b>\n    {' · '.join(ou_parts)}")
 
     # ── BTTS ──
     if result.p_btts_yes is not None:
         lines.append(
-            f"🎯 <b>BTTS:</b>  Sí <b>{_pct(result.p_btts_yes)}</b>  ·  "
+            f"\n🎯 <b>Ambos Anotan (BTTS)</b>\n"
+            f"    Sí <b>{_pct(result.p_btts_yes)}</b>  ·  "
             f"No <b>{_pct(result.p_btts_no)}</b>"
         )
 
     # ── Double chance ──
     lines.append(
-        f"🔄 <b>Doble oportunidad:</b>\n"
+        f"\n🔄 <b>Doble Oportunidad</b>\n"
         f"    1X <b>{_pct(result.p_1x)}</b>  ·  "
         f"X2 <b>{_pct(result.p_x2)}</b>  ·  "
         f"12 <b>{_pct(result.p_12)}</b>"
@@ -401,11 +541,13 @@ def _format_prediction(result) -> str:
     # ── Top scorelines ──
     top = result.top_scorelines
     if top:
-        scores = [f"<b>{s}</b> {p}%" for s, p in list(top.items())[:5]]
-        lines.append(f"🥅 <b>Marcadores:</b>  {', '.join(scores)}")
+        scores = [f"<b>{s}</b> ({p}%)" for s, p in list(top.items())[:5]]
+        lines.append(f"\n🥅 <b>Marcadores más probables</b>\n    {', '.join(scores)}")
 
-    # ── Data quality footer ──
-    lines.append(f"\n<i>ℹ️ {result.data_quality or ''}</i>")
+    # ── Footer ──
+    lines.append("━━━━━━━━━━━━━━━━━━━━━")
+    quality = result.data_quality or ""
+    lines.append(f"<i>ℹ️ {quality}\n🔮 Modelo: Dixon-Coles · Calibración Platt</i>")
 
     text = "\n".join(lines)
     if len(text) > 4000:
@@ -417,25 +559,35 @@ def _format_prediction(result) -> str:
 
 async def cmd_valuebets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show top value bets (model vs market)."""
+    await _do_valuebets(update.message, context)
+
+
+async def _do_valuebets(message, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Shared logic for /valuebets command and inline button."""
     db = _db()
     try:
         svc = ValueService(db)
         bets = svc.top_value_bets(min_edge=0.03, limit=10)
 
         if not bets:
-            await _safe_reply(
-                update,
+            back_btn = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🏆 Ver ligas", callback_data="menu_leagues"),
+                InlineKeyboardButton("📅 Partidos", callback_data="menu_matches"),
+            ]])
+            await _safe_edit_or_send(
+                message,
                 "📭 No hay value bets disponibles.\n"
                 "Necesitas odds de mercado cargadas para detectar valor.",
+                reply_markup=back_btn,
             )
             return
 
         text = _format_value_bets(bets, db)
-        await _safe_reply(update, text, parse_mode="HTML")
+        await _safe_edit_or_send(message, text, parse_mode="HTML")
     except Exception:
         logger.exception("Error en /valuebets")
-        await _safe_reply(
-            update,
+        await _safe_edit_or_send(
+            message,
             "⚠️ Error al obtener value bets. Intenta de nuevo.",
         )
     finally:
@@ -481,7 +633,12 @@ def _format_value_bets(bets: list[dict], db: Session) -> str:
             f"    📊 Cuotas: {odds_data['home']:.2f} / {odds_data['draw']:.2f} / {odds_data['away']:.2f}\n"
         )
 
-    lines.append("<i>Edge = ventaja del modelo sobre el mercado (multiplicativa)</i>")
+    lines.append(
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "<i>📈 Edge = ventaja del modelo sobre el mercado\n"
+        "💰 Stake = % del bankroll (Kelly fraccionado 10%, tope 5%)\n"
+        "🟢 = unidad de stake recomendada</i>"
+    )
 
     text = "\n".join(lines)
     if len(text) > 4000:
@@ -529,9 +686,24 @@ async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> 
         try:
             await update.message.reply_text(
                 "⚠️ Ocurrió un error inesperado. Intenta de nuevo en unos minutos.",
+                reply_markup=_main_menu_keyboard(),
             )
         except Exception:
             pass  # can't send — network is likely down
+
+
+# ── Fallback for free text ────────────────────────────────────────────────
+
+async def _fallback_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle any non-command text message by guiding user to the menu."""
+    await _safe_reply(
+        update,
+        "🤖 No entendí ese mensaje.\n\n"
+        "Usa los botones de abajo o escribe un comando:\n"
+        "  /leagues · /matches · /predict · /valuebets",
+        parse_mode="HTML",
+        reply_markup=_main_menu_keyboard(),
+    )
 
 
 # ── main ──────────────────────────────────────────────────────────────────
@@ -546,10 +718,17 @@ def main() -> None:
 
     # Command handlers
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("leagues", cmd_leagues))
     app.add_handler(CommandHandler("matches", cmd_matches))
     app.add_handler(CommandHandler("predict", cmd_predict))
     app.add_handler(CommandHandler("valuebets", cmd_valuebets))
+
+    # Inline button handler (main menu + league selection)
+    app.add_handler(CallbackQueryHandler(_callback_handler))
+
+    # Fallback: any text that isn't a command → guide to menu
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _fallback_text))
 
     # Global error handler — prevents crashes on unhandled exceptions
     app.add_error_handler(_error_handler)
