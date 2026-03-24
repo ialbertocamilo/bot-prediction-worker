@@ -11,7 +11,7 @@ from app.repositories.prediction.market_odds_repository import MarketOddsReposit
 from app.repositories.prediction.model_repository import ModelRepository
 from app.repositories.prediction.prediction_repository import PredictionRepository
 from app.services.prediction.prediction_service import PredictionService
-from app.services.prediction.value_service import ValueService, odds_to_probs, compute_edge, compute_kelly_stake
+from app.services.prediction.value_service import ValueService, odds_to_probs, compute_edge, compute_kelly_stake, compute_stake_rating
 
 router = APIRouter()
 
@@ -55,6 +55,7 @@ def _value_analysis(p_home: float, p_draw: float, p_away: float,
             "ev": round(mult_edge, 4),
             "kelly_raw": round(ks["kelly_raw"], 4),
             "recommended_stake_percent": round(ks["recommended_stake_percent"], 4),
+            "stake_rating": compute_stake_rating(ks["recommended_stake_percent"]),
             "is_value": mult_edge > 0,
         })
     return {
@@ -149,6 +150,7 @@ def upcoming(
                         "recommended_stake_percent": round(ks["recommended_stake_percent"], 4),
                         "kelly_raw": round(ks["kelly_raw"], 4),
                         "edge_additive": round(ks["edge"], 4),
+                        "stake_rating": compute_stake_rating(ks["recommended_stake_percent"]),
                     }
                 item["recommended_stakes"] = stakes
 
@@ -219,6 +221,7 @@ def predict(
                 "recommended_stake_percent": round(ks["recommended_stake_percent"], 4),
                 "kelly_raw": round(ks["kelly_raw"], 4),
                 "edge_additive": round(ks["edge"], 4),
+                "stake_rating": compute_stake_rating(ks["recommended_stake_percent"]),
             }
         response["recommended_stakes"] = stakes
     else:

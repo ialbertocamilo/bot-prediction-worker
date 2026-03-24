@@ -31,7 +31,7 @@ from app.db.models.football.match import Match
 from app.db.session import SessionLocal
 from app.services.canonical_league_service import CanonicalLeagueService
 from app.services.prediction.prediction_service import PredictionService
-from app.services.prediction.value_service import ValueService
+from app.services.prediction.value_service import ValueService, compute_kelly_stake, compute_stake_rating
 
 load_dotenv()
 
@@ -464,11 +464,20 @@ def _format_value_bets(bets: list[dict], db: Session) -> str:
         odds_data = bet["market_odds"]
         date_str = match.utc_date.strftime("%d/%m %H:%M") if match.utc_date else ""
 
+        # Compute stake rating for the best outcome
+        outcome_key = best["outcome"]  # "home", "draw", "away"
+        model_p = bet["model_probabilities"][f"p_{outcome_key}"]
+        outcome_odds = odds_data[outcome_key]
+        ks = compute_kelly_stake(model_p, outcome_odds)
+        rating = compute_stake_rating(ks["recommended_stake_percent"])
+        stake_bar = "🟢" * rating + "⚪" * (10 - rating)
+
         lines.append(
             f"<b>{i}.</b> {home} vs {away}\n"
             f"    🕐 {date_str} UTC\n"
             f"    💰 Apuesta: <b>{outcome_label}</b>\n"
             f"    📈 Edge: <b>+{edge_pct:.1f}%</b>\n"
+            f"    🎯 Stake: {stake_bar} <b>{rating}/10</b>\n"
             f"    📊 Cuotas: {odds_data['home']:.2f} / {odds_data['draw']:.2f} / {odds_data['away']:.2f}\n"
         )
 

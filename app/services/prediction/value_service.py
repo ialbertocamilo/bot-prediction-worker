@@ -145,6 +145,29 @@ def compute_kelly_stake(
     }
 
 
+def compute_stake_rating(recommended_stake_pct: float) -> int:
+    """Map recommended_stake_percent to an intuitive 0-10 rating.
+
+    0  = no bet (edge <= 0)
+    1-2 = minimal confidence
+    3-4 = low
+    5-6 = medium
+    7-8 = high
+    9-10 = very high (near or at MAX_STAKE cap)
+    """
+    if recommended_stake_pct <= 0:
+        return 0
+    if recommended_stake_pct <= 0.005:
+        return 1 + int(recommended_stake_pct / 0.005)  # 1
+    if recommended_stake_pct <= 0.010:
+        return 3 + int((recommended_stake_pct - 0.005) / 0.005)  # 3
+    if recommended_stake_pct <= 0.020:
+        return 5 + int((recommended_stake_pct - 0.010) / 0.010)  # 5
+    if recommended_stake_pct <= 0.035:
+        return 7 + int((recommended_stake_pct - 0.020) / 0.015)  # 7
+    return min(9 + int((recommended_stake_pct - 0.035) / 0.015), 10)  # 9-10
+
+
 class ValueService:
     """Compares model predictions against market odds to find value."""
 
