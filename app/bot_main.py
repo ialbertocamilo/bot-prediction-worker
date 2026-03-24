@@ -25,11 +25,12 @@ import asyncio
 import logging
 import os
 import time
+from datetime import datetime, timezone as _tz
 
 from dotenv import load_dotenv
 from sqlalchemy.orm import Session
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.error import NetworkError, RetryAfter, TimedOut
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -41,7 +42,11 @@ from telegram.ext import (
 
 from app.db.models.football.match import Match
 from app.db.session import SessionLocal
-from app.services.canonical_league_service import CanonicalLeagueService
+from app.services.canonical_league_service import (
+    CanonicalLeagueService,
+    LEAGUE_GROUPS,
+    background_ingest,
+)
 from app.services.prediction.prediction_service import PredictionService
 from app.services.prediction.value_service import ValueService, compute_kelly_stake, compute_stake_rating
 
@@ -53,12 +58,24 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Silence noisy third-party loggers
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("apscheduler").setLevel(logging.WARNING)
+
 TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ADMIN_CHAT_ID: str = os.getenv("ADMIN_CHAT_ID", "")
 DAILY_ALERT_HOUR: int = int(os.getenv("DAILY_ALERT_HOUR", "8"))  # UTC
 
 # Anti-spam: minimum seconds between bulk messages (Telegram limit: 30 msg/s)
 _BULK_SEND_DELAY = 0.05  # 50ms → max ~20 msg/s, well within limits
+
+# Staleness threshold for silent background refresh
+_STALE_THRESHOLD_SECS: int = 2 * 3600  # 2 hours
+
+# Per-user cooldown: ignore rapid-fire clicks from the same user
+_USER_COOLDOWN_SECS: float = 2.0
+_user_cooldowns: dict[int, float] = {}
 
 # In-memory cache of the latest /matches listing per chat.
 _CACHE_TTL_SECS = 900  # 15 minutes
@@ -211,6 +228,14 @@ async def _callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     query = update.callback_query
     await query.answer()  # Acknowledge immediately to stop loading spinner
 
+    # ── Per-user cooldown ─────────────────────────────────────────
+    user_id = update.effective_user.id if update.effective_user else 0
+    now = time.monotonic()
+    last = _user_cooldowns.get(user_id, 0.0)
+    if now - last < _USER_COOLDOWN_SECS:
+        return  # silently ignore spam clicks
+    _user_cooldowns[user_id] = now
+
     data = query.data or ""
     if data == "menu_leagues":
         await _do_leagues(query.message, context)
@@ -318,76 +343,208 @@ async def cmd_matches(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await _do_matches(update.message, context, canonical_index=canonical_index)
 
 
-async def _do_matches(message, context: ContextTypes.DEFAULT_TYPE, *, canonical_index: int | None) -> None:
-    """Shared logic for /matches command and inline buttons."""
+def _render_matches(
+    upcoming: list[Match],
+    svc: CanonicalLeagueService,
+    filter_label: str = "",
+) -> str:
+    """Build the HTML text for a list of upcoming matches."""
+    lines = [f"⚽ <b>Próximos partidos{_esc(filter_label)}</b>\n"]
+    current_league = ""
+
+    for idx, m in enumerate(upcoming[:30], 1):
+        league_name = svc.display_name_for(m.league_id)
+        if league_name != current_league:
+            current_league = league_name
+            lines.append(f"\n🏆 <b>{_esc(league_name)}</b>")
+
+        home = _esc(m.home_team.name if m.home_team else "?")
+        away = _esc(m.away_team.name if m.away_team else "?")
+        date_str = m.utc_date.strftime("%d/%m %H:%M") if m.utc_date else "?"
+        rnd = f" (J{_esc(m.round)})" if m.round else ""
+
+        lines.append(
+            f"  <b>{idx}.</b> {home} vs {away}\n"
+            f"      🕐 {date_str} UTC{rnd}"
+        )
+
+    lines.append(
+        "\n<i>Usa /predict &lt;num&gt; para ver la predicción.\n"
+        "Ejemplo: /predict 1</i>"
+    )
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:3950] + "\n..."
+    return text
+
+
+async def _background_ui_updater(
+    *,
+    bot: Bot,
+    chat_id: int,
+    message_id: int,
+    canonical_index: int,
+    display_name: str,
+) -> None:
+    """Fire-and-forget: ingest data from provider, then overwrite the
+    loading message with the final match list.  Owns its own DB session."""
+    try:
+        await background_ingest(canonical_index)
+
+        db = SessionLocal()
+        try:
+            svc = CanonicalLeagueService(db)
+            upcoming = svc.get_upcoming(canonical_index)
+
+            if upcoming:
+                _cache_set(chat_id, upcoming)
+                text = _render_matches(upcoming, svc, f" — {display_name}")
+            else:
+                text = (
+                    f"📭 No hay partidos programados para "
+                    f"<b>{_esc(display_name)}</b>."
+                )
+
+            try:
+                await bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=text,
+                    parse_mode="HTML",
+                )
+            except BadRequest as exc:
+                logger.debug(
+                    "edit_message_text failed (chat=%d): %s", chat_id, exc,
+                )
+        finally:
+            db.close()
+    except Exception:
+        logger.exception(
+            "Error en _background_ui_updater (liga %d)", canonical_index,
+        )
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=(
+                    f"❌ Error obteniendo datos para "
+                    f"<b>{_esc(display_name)}</b>."
+                ),
+                parse_mode="HTML",
+            )
+        except Exception:
+            logger.debug("Failed to send error msg to chat %d", chat_id)
+
+
+def _is_stale(last_ingest: datetime | None) -> bool:
+    """Return True if the league data should be refreshed silently."""
+    if last_ingest is None:
+        return True
+    age = (datetime.now(_tz.utc) - last_ingest).total_seconds()
+    return age > _STALE_THRESHOLD_SECS
+
+
+async def _do_matches(
+    message,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    canonical_index: int | None,
+) -> None:
+    """Always-Live match handler.
+
+    1. Priority 1 — instant DB read.
+    2. Render decision:
+       - Matches found → show immediately.
+       - 0 matches + league previously ingested → show 'no matches'.
+       - Never ingested (last_ingest_at is NULL) → loading + UI updater.
+    3. Silent refresh — if data older than 2 h, fire-and-forget
+       background_ingest WITHOUT touching the user's message.
+    """
     db = _db()
     try:
         svc = CanonicalLeagueService(db)
 
-        # Auto-ingest if the selected canonical league has no matches
+        # ── Validate index ────────────────────────────────────────────
         if canonical_index is not None:
             leagues = svc.list_leagues()
             if canonical_index < 1 or canonical_index > len(leagues):
                 await _safe_edit_or_send(
                     message,
-                    f"⚠️ Liga fuera de rango. Usa /leagues para ver los números.",
+                    "⚠️ Liga fuera de rango. Usa /leagues para ver los números.",
                 )
                 return
-            ingested = svc.auto_ingest_if_empty(canonical_index)
-            if ingested:
-                logger.info("Auto-ingest: %d partidos nuevos", ingested)
 
+        # ── Fast DB read (microseconds on PostgreSQL) ─────────────────
         upcoming = svc.get_upcoming(canonical_index)
+        last_ingest = (
+            svc.get_last_ingest_at(canonical_index)
+            if canonical_index is not None
+            else None
+        )
 
-        if not upcoming:
-            filter_msg = f" para liga {canonical_index}" if canonical_index else ""
-            back_btn = InlineKeyboardMarkup([[
-                InlineKeyboardButton("🏆 Ver ligas", callback_data="menu_leagues"),
-                InlineKeyboardButton("🏠 Menú", callback_data="menu_help"),
-            ]])
+        if upcoming:
+            # ── LIVE PATH: data exists → respond instantly ────────────
+            _cache_set(message.chat_id, upcoming)
+
+            filter_label = ""
+            if canonical_index is not None:
+                filter_label = f" — {leagues[canonical_index - 1].display_name}"
+
+            text = _render_matches(upcoming, svc, filter_label)
+            await _safe_edit_or_send(message, text, parse_mode="HTML")
+
+            # Silent background refresh if stale (user never notices)
+            if canonical_index is not None and _is_stale(last_ingest):
+                asyncio.create_task(background_ingest(canonical_index))
+            return
+
+        # ── 0 matches — decide between 'no matches' and 'loading' ─────
+        if canonical_index is not None:
+            info = leagues[canonical_index - 1]
+
+            if last_ingest is not None:
+                # League ingested before → genuinely no scheduled games
+                await _safe_edit_or_send(
+                    message,
+                    f"📭 No hay partidos programados para "
+                    f"<b>{_esc(info.display_name)}</b>.",
+                    parse_mode="HTML",
+                )
+                # Still refresh silently if stale
+                if _is_stale(last_ingest):
+                    asyncio.create_task(background_ingest(canonical_index))
+                return
+
+            # Never ingested → true cold start with UI updater
             await _safe_edit_or_send(
                 message,
-                f"📭 No hay partidos programados{filter_msg}.",
-                reply_markup=back_btn,
+                f"⏳ Obteniendo datos por primera vez para "
+                f"<b>{_esc(info.display_name)}</b>.\n"
+                "Este mensaje se actualizará automáticamente.",
+                parse_mode="HTML",
+            )
+            asyncio.create_task(
+                _background_ui_updater(
+                    bot=context.bot,
+                    chat_id=message.chat_id,
+                    message_id=message.message_id,
+                    canonical_index=canonical_index,
+                    display_name=info.display_name,
+                )
             )
             return
 
-        chat_id = message.chat_id
-        _cache_set(chat_id, upcoming)
-
-        filter_label = ""
-        if canonical_index is not None:
-            info = svc.list_leagues()[canonical_index - 1]
-            filter_label = f" — {info.display_name}"
-
-        lines = [f"⚽ <b>Próximos partidos{_esc(filter_label)}</b>\n"]
-        current_league = ""
-
-        for idx, m in enumerate(upcoming[:30], 1):
-            league_name = svc.display_name_for(m.league_id)
-            if league_name != current_league:
-                current_league = league_name
-                lines.append(f"\n🏆 <b>{_esc(league_name)}</b>")
-
-            home = _esc(m.home_team.name if m.home_team else "?")
-            away = _esc(m.away_team.name if m.away_team else "?")
-            date_str = m.utc_date.strftime("%d/%m %H:%M") if m.utc_date else "?"
-            rnd = f" (J{_esc(m.round)})" if m.round else ""
-
-            lines.append(
-                f"  <b>{idx}.</b> {home} vs {away}\n"
-                f"      🕐 {date_str} UTC{rnd}"
-            )
-
-        lines.append(
-            "\n<i>Usa /predict &lt;num&gt; para ver la predicción.\n"
-            "Ejemplo: /predict 1</i>"
+        # No canonical_index and no data → empty state
+        back_btn = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🏆 Ver ligas", callback_data="menu_leagues"),
+            InlineKeyboardButton("🏠 Menú", callback_data="menu_help"),
+        ]])
+        await _safe_edit_or_send(
+            message,
+            "📭 No hay partidos programados.",
+            parse_mode="HTML",
+            reply_markup=back_btn,
         )
-
-        text = "\n".join(lines)
-        if len(text) > 4000:
-            text = text[:3950] + "\n..."
-        await _safe_edit_or_send(message, text, parse_mode="HTML")
     except Exception:
         logger.exception("Error en /matches")
         await _safe_edit_or_send(message, "⚠️ Error al obtener partidos. Intenta de nuevo.")
@@ -706,6 +863,46 @@ async def _fallback_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
 
+# ── Cache Pre-warming ─────────────────────────────────────────────────────
+
+_HYDRATION_DELAY_SECONDS: int = 15
+_HYDRATION_INTERVAL_SECONDS: int = 4 * 3600  # 4 hours
+
+
+async def _hydrate_all_leagues() -> None:
+    """Iterate every configured league and ingest data with throttling.
+
+    Each league ingestion is isolated (its own DB session inside
+    ``background_ingest``).  A 15-second delay between leagues prevents
+    the ESPN scraper from being rate-limited.
+    """
+    total: int = len(LEAGUE_GROUPS)
+    logger.info("Hydration: starting for %d leagues", total)
+    for idx in range(1, total + 1):
+        try:
+            await background_ingest(idx)
+        except Exception:
+            logger.exception("Hydration error for league index %d", idx)
+        if idx < total:
+            await asyncio.sleep(_HYDRATION_DELAY_SECONDS)
+    logger.info("Hydration: complete for %d leagues", total)
+
+
+async def _post_init(app: Application) -> None:
+    """post_init hook — launch cache pre-warming as a fire-and-forget task.
+
+    The task runs entirely in the background; the bot starts accepting
+    messages immediately without waiting for hydration to finish.
+    """
+    asyncio.create_task(_hydrate_all_leagues(), name="cache-prewarm")
+    logger.info("Post-init: cache pre-warming task launched (non-blocking)")
+
+
+async def _scheduled_hydration(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """JobQueue callback — periodic re-hydration of all leagues."""
+    asyncio.create_task(_hydrate_all_leagues(), name="scheduled-hydration")
+
+
 # ── main ──────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -714,7 +911,7 @@ def main() -> None:
         logger.error("TELEGRAM_BOT_TOKEN no configurado en .env")
         return
 
-    app = Application.builder().token(token).build()
+    app = Application.builder().token(token).post_init(_post_init).build()
 
     # Command handlers
     app.add_handler(CommandHandler("start", cmd_start))
@@ -732,6 +929,18 @@ def main() -> None:
 
     # Global error handler — prevents crashes on unhandled exceptions
     app.add_error_handler(_error_handler)
+
+    # Recurring hydration every 4 hours (first run deferred — post_init handles startup)
+    app.job_queue.run_repeating(
+        _scheduled_hydration,
+        interval=_HYDRATION_INTERVAL_SECONDS,
+        first=_HYDRATION_INTERVAL_SECONDS,
+        name="hydrate_all_leagues",
+    )
+    logger.info(
+        "Hydration job scheduled: every %d h",
+        _HYDRATION_INTERVAL_SECONDS // 3600,
+    )
 
     # Daily value bets alert (via python-telegram-bot's JobQueue)
     if ADMIN_CHAT_ID:

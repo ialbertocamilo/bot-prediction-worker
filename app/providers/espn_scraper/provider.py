@@ -132,3 +132,71 @@ class EspnScraperProvider(BaseProvider):
             except Exception:
                 self._cached_league_name = None
         return self._cached_league_name
+
+    # ══════════════════════════════════════════════════════════════
+    # ASYNC methods — used by the bot for non-blocking I/O
+    # ══════════════════════════════════════════════════════════════
+
+    async def _aget_league_name(self) -> str | None:
+        """Async version of _get_league_name (cached)."""
+        if not hasattr(self, "_cached_league_name"):
+            try:
+                payload = await self.client.aget_league_info()
+                for league_data in payload.get("leagues", []):
+                    self._cached_league_name: str | None = (
+                        EspnScraperMapper.map_league(league_data).name
+                        if EspnScraperMapper.map_league(league_data)
+                        else None
+                    )
+                    break
+                else:
+                    self._cached_league_name = None
+            except Exception:
+                self._cached_league_name = None
+        return self._cached_league_name
+
+    async def aget_fixtures(
+        self,
+        league_id: int,
+        season: int,
+        date_from: date,
+        date_to: date,
+    ) -> list[CanonicalMatch]:
+        """Async: fetch scheduled fixtures via httpx."""
+        raw_events = await self.client.aget_matches_in_range(date_from, date_to)
+        league_name = await self._aget_league_name()
+        matches: list[CanonicalMatch] = []
+        for event in raw_events:
+            m = EspnScraperMapper.map_match(event)
+            if m.status == MatchStatus.scheduled:
+                if m.league_name is None:
+                    m = m.model_copy(update={"league_name": league_name})
+                matches.append(m)
+        logger.info(
+            "ESPN async fixtures: %d SCHEDULED (%s → %s)",
+            len(matches), date_from, date_to,
+        )
+        return matches
+
+    async def aget_results(
+        self,
+        league_id: int,
+        season: int,
+        date_from: date,
+        date_to: date,
+    ) -> list[CanonicalMatch]:
+        """Async: fetch finished results via httpx."""
+        raw_events = await self.client.aget_matches_in_range(date_from, date_to)
+        league_name = await self._aget_league_name()
+        matches: list[CanonicalMatch] = []
+        for event in raw_events:
+            m = EspnScraperMapper.map_match(event)
+            if m.status == MatchStatus.finished:
+                if m.league_name is None:
+                    m = m.model_copy(update={"league_name": league_name})
+                matches.append(m)
+        logger.info(
+            "ESPN async results: %d FINISHED (%s → %s)",
+            len(matches), date_from, date_to,
+        )
+        return matches

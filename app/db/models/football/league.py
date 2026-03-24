@@ -17,6 +17,9 @@ class League(Base):
         server_default=func.now(),
         nullable=False
     )
+    last_ingest_at: Mapped[object | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
 
     __table_args__ = (
         UniqueConstraint("name", "country", name="uq_leagues_name_country"),

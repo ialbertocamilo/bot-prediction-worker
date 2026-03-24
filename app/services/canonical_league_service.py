@@ -10,6 +10,7 @@ ningún grupo se muestran tal cual (standalone).
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from dataclasses import dataclass, field
@@ -20,9 +21,14 @@ from sqlalchemy.orm import Session
 
 from app.db.models.football.league import League
 from app.db.models.football.match import Match
+from app.db.session import SessionLocal
 from app.repositories.football.match_repository import MatchRepository
 
 logger = logging.getLogger(__name__)
+
+# Ventana temporal para partidos "próximos" — usada tanto en list_leagues
+# (conteo de scheduled) como en get_upcoming (lectura de detalle).
+UPCOMING_DAYS_WINDOW = 14
 
 
 # ── Configuración de grupos canónicos ─────────────────────────────────────
@@ -248,7 +254,7 @@ def domestic_key_for_league_name(league_name: str) -> str | None:
     for g in _DOMESTIC_GROUPS:
         for p in g.league_names:
             pl = p.lower().strip()
-            if ln == pl or pl in ln or ln in pl:
+            if ln == pl or pl in ln:
                 return g.key
     return None
 
@@ -301,22 +307,40 @@ class CanonicalLeagueService:
     # ── resolver IDs de DB dinámicamente ─────────────────────────────────
 
     def _resolve_league_ids(self, group: _LeagueGroup) -> list[int]:
-        """Combine static db_league_ids + auto-discovery by league_names."""
+        """Combine static db_league_ids + auto-discovery by league_names.
+
+        Country guard: if the group has a country AND the DB league has a
+        different country, skip it — prevents 'Primera División' (Peru)
+        from capturing 'Chilean Primera División' (Chile).
+        """
         ids: set[int] = set(group.db_league_ids)
         if group.league_names:
             all_leagues = list(self.db.scalars(select(League)))
             for lg in all_leagues:
                 if self._name_matches(lg.name, group.league_names):
+                    # Country mismatch → skip (both must have a country set)
+                    if (
+                        group.country
+                        and lg.country
+                        and lg.country.lower().strip() != group.country.lower().strip()
+                    ):
+                        continue
                     ids.add(lg.id)
         return sorted(ids)
 
     @staticmethod
     def _name_matches(db_name: str, patterns: list[str]) -> bool:
-        """Case-insensitive match: exact OR either is substring of the other."""
+        """Case-insensitive match: exact OR pattern is a substring of db_name.
+
+        NOTE: only checks `p_lower in db_lower`, NOT the reverse.
+        The reverse (`db_lower in p_lower`) caused cross-league contamination
+        — e.g. DB name 'Primera División' matched Chile's pattern
+        'Chilean Primera División' when it should only match Peru.
+        """
         db_lower = db_name.lower().strip()
         for p in patterns:
             p_lower = p.lower().strip()
-            if db_lower == p_lower or p_lower in db_lower or db_lower in p_lower:
+            if db_lower == p_lower or p_lower in db_lower:
                 return True
         return False
 
@@ -372,7 +396,7 @@ class CanonicalLeagueService:
     def get_upcoming(
         self,
         canonical_index: int | None = None,
-        days_ahead: int = 14,
+        days_ahead: int = UPCOMING_DAYS_WINDOW,
     ) -> list[Match]:
         """Devuelve partidos SCHEDULED deduplicados.
 
@@ -414,6 +438,7 @@ class CanonicalLeagueService:
         """Sincroniza desde el provider configurado si no hay programados.
 
         Retorna cantidad de partidos ingestados (0 si no fue necesario).
+        Versión SYNC — para scripts y CLI.
         """
         league_ids = self._ids_for_index(canonical_index)
 
@@ -429,6 +454,81 @@ class CanonicalLeagueService:
             return 0
 
         return self._ingest_from_provider(cfg)
+
+    async def async_auto_ingest_if_empty(self, canonical_index: int) -> int:
+        """Async version of auto_ingest_if_empty — non-blocking HTTP via httpx.
+
+        The HTTP fetches run natively async; the DB writes are fast and remain sync.
+        """
+        league_ids = self._ids_for_index(canonical_index)
+
+        leagues = self.list_leagues()
+        if canonical_index < 1 or canonical_index > len(leagues):
+            return 0
+        info = leagues[canonical_index - 1]
+        cfg = self._groups.get(info.key)
+        if not cfg or not cfg.provider_name:
+            return 0
+
+        if league_ids and self.get_upcoming(canonical_index):
+            return 0
+
+        return await self._async_ingest_from_provider(cfg)
+
+    async def _async_ingest_from_provider(
+        self,
+        cfg: _LeagueGroup,
+        days_back: int = 60,
+        days_ahead: int = 14,
+    ) -> int:
+        """Async ingest: HTTP via httpx, DB writes via sync SQLAlchemy."""
+        logger.info(
+            "Async ingest: '%s' desde %s (slug=%s)",
+            cfg.display_name, cfg.provider_name, cfg.provider_slug,
+        )
+
+        from app.providers.espn_scraper.client import EspnScraperClient
+        from app.providers.espn_scraper.provider import EspnScraperProvider
+
+        client = EspnScraperClient(league_slug=cfg.provider_slug)
+        provider = EspnScraperProvider(client=client)
+
+        d_from = date.today() - timedelta(days=days_back)
+        d_to = date.today() + timedelta(days=days_ahead)
+        season = cfg.provider_season or int(os.getenv("DEFAULT_SEASON", "2026"))
+        ext_id = cfg.provider_league_id or 0
+
+        # Fetch results + fixtures concurrently via async HTTP
+        results, fixtures = await asyncio.gather(
+            provider.aget_results(
+                league_id=ext_id, season=season, date_from=d_from, date_to=d_to,
+            ),
+            provider.aget_fixtures(
+                league_id=ext_id, season=season, date_from=d_from, date_to=d_to,
+            ),
+        )
+        all_m = results + fixtures
+
+        if not all_m:
+            logger.info("Async ingest: 0 partidos para '%s'", cfg.display_name)
+            return 0
+
+        # DB writes are fast — keep sync
+        from app.services.ingest.match_ingest_service import MatchIngestService
+
+        svc = MatchIngestService(self.db)
+        ids = svc.ingest_matches(all_m)
+        self.db.commit()
+
+        self._rebuild_mappings()
+        self._fix_league_metadata(cfg)
+        self._stamp_ingest_ts(cfg)
+
+        logger.info(
+            "Async ingest: %d partidos para '%s' (provider=%s)",
+            len(ids), cfg.display_name, cfg.provider_name,
+        )
+        return len(ids)
 
     def ingest_league(self, key: str, days_back: int = 180, days_ahead: int = 30) -> int:
         """Ingest results + fixtures for a league group by key.
@@ -499,6 +599,7 @@ class CanonicalLeagueService:
 
         # Post-ingest: propagate country & set is_current on seasons
         self._fix_league_metadata(cfg)
+        self._stamp_ingest_ts(cfg)
 
         logger.info(
             "Ingest: %d partidos para '%s' (provider=%s)",
@@ -577,6 +678,40 @@ class CanonicalLeagueService:
                 "_fix_league_metadata: commit failed for '%s'", cfg.display_name,
             )
 
+    # ── ingest timestamp ─────────────────────────────────────────────────
+
+    def _stamp_ingest_ts(self, cfg: _LeagueGroup) -> None:
+        """Set ``last_ingest_at = now()`` on every DB league in the group."""
+        ids = self._resolved.get(cfg.key, [])
+        if not ids:
+            return
+        now = datetime.now(timezone.utc)
+        for lid in ids:
+            lg = self.db.get(League, lid)
+            if lg is not None:
+                lg.last_ingest_at = now
+        try:
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            logger.exception(
+                "_stamp_ingest_ts: commit failed for '%s'", cfg.display_name,
+            )
+
+    def get_last_ingest_at(
+        self, canonical_index: int,
+    ) -> datetime | None:
+        """Return the most recent ``last_ingest_at`` across all DB leagues
+        in the canonical group, or ``None`` if never ingested."""
+        ids = self._ids_for_index(canonical_index)
+        if not ids:
+            return None
+        ts = self.db.scalar(
+            select(func.max(League.last_ingest_at))
+            .where(League.id.in_(ids))
+        )
+        return ts  # type: ignore[return-value]
+
     # ── helpers privados ──────────────────────────────────────────────────
 
     def _ids_for_index(self, canonical_index: int) -> list[int]:
@@ -619,11 +754,16 @@ class CanonicalLeagueService:
             old = result.get(row[0], (0, 0))
             result[row[0]] = (row[1], old[1])
 
-        # Scheduled counts grouped by league_id
+        # Scheduled counts grouped by league_id — same temporal window
+        # as get_upcoming() so the count matches what the user will see.
+        now = datetime.now(timezone.utc)
+        upcoming_cutoff = now + timedelta(days=UPCOMING_DAYS_WINDOW)
         sch_stmt = (
             select(Match.league_id, func.count(Match.id))
             .where(Match.league_id.in_(league_ids))
             .where(Match.status.in_(("SCHEDULED", "NS")))
+            .where(Match.utc_date >= now)
+            .where(Match.utc_date <= upcoming_cutoff)
             .group_by(Match.league_id)
         )
         for row in self.db.execute(sch_stmt):
@@ -746,3 +886,40 @@ class CanonicalLeagueService:
             "sync_historical_domestic_keys: %d/%d teams updated", updated, len(teams),
         )
         return updated
+
+
+_active_ingestions: set[int] = set()
+
+
+async def background_ingest(canonical_index: int) -> None:
+    """Fire-and-forget coroutine for background provider ingest.
+
+    Owns its own DB session so the caller can return immediately.
+    Designed to be launched via ``asyncio.create_task()``.
+
+    A module-level ``_active_ingestions`` set acts as an in-memory guard:
+    if the same ``canonical_index`` is already being ingested, the call
+    returns immediately to avoid duplicate ESPN requests and DB collisions.
+    """
+    if canonical_index in _active_ingestions:
+        logger.debug(
+            "Background ingest: league %d already in progress — skipping",
+            canonical_index,
+        )
+        return
+
+    _active_ingestions.add(canonical_index)
+    db = SessionLocal()
+    try:
+        svc = CanonicalLeagueService(db)
+        ingested = await svc.async_auto_ingest_if_empty(canonical_index)
+        if ingested:
+            logger.info(
+                "Background ingest: %d partidos nuevos (liga %d)",
+                ingested, canonical_index,
+            )
+    except Exception:
+        logger.exception("Error en background ingest (liga %d)", canonical_index)
+    finally:
+        db.close()
+        _active_ingestions.discard(canonical_index)
