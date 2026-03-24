@@ -168,7 +168,6 @@ def _main_menu_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("📅 Partidos de hoy", callback_data="menu_matches"),
         ],
         [
-            InlineKeyboardButton("📈 Value Bets", callback_data="menu_valuebets"),
             InlineKeyboardButton("❓ Ayuda", callback_data="menu_help"),
         ],
     ])
@@ -654,9 +653,9 @@ def _format_prediction(result) -> str:
     bar_a = max(0, bar_a)
     lines.append(
         f"\n📊 <b>Probabilidades 1X2</b>\n"
-        f"    🏠 Local    <b>{_pct(p_h)}</b>  {'▓' * bar_h}{'░' * (20 - bar_h)}\n"
+        f"    🏠 {home}  <b>{_pct(p_h)}</b>  {'▓' * bar_h}{'░' * (20 - bar_h)}\n"
         f"    🤝 Empate  <b>{_pct(p_d)}</b>  {'▓' * bar_d}{'░' * (20 - bar_d)}\n"
-        f"    ✈️ Visita   <b>{_pct(p_a)}</b>  {'▓' * bar_a}{'░' * (20 - bar_a)}"
+        f"    ✈️ {away}  <b>{_pct(p_a)}</b>  {'▓' * bar_a}{'░' * (20 - bar_a)}"
     )
 
     # ── xG ──
@@ -690,9 +689,9 @@ def _format_prediction(result) -> str:
     # ── Double chance ──
     lines.append(
         f"\n🔄 <b>Doble Oportunidad</b>\n"
-        f"    1X <b>{_pct(result.p_1x)}</b>  ·  "
-        f"X2 <b>{_pct(result.p_x2)}</b>  ·  "
-        f"12 <b>{_pct(result.p_12)}</b>"
+        f"    {home} o Empate <b>{_pct(result.p_1x)}</b>\n"
+        f"    {away} o Empate <b>{_pct(result.p_x2)}</b>\n"
+        f"    {home} o {away} <b>{_pct(result.p_12)}</b>"
     )
 
     # ── Top scorelines ──
