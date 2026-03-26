@@ -136,10 +136,16 @@ class MatchIngestService:
                     "Existe external_id para match pero no existe el match canónico"
                 )
 
+            # Detect team changes (e.g. placeholder → real team in knockout rounds)
+            new_home = home_team_id if home_team_id != existing_match.home_team_id else None
+            new_away = away_team_id if away_team_id != existing_match.away_team_id else None
+
             updated_match = self.match_repo.update(
                 existing_match,
                 status=canonical_match.status.value,
                 venue_id=venue_id,
+                home_team_id=new_home,
+                away_team_id=new_away,
                 home_goals=canonical_match.home_goals,
                 away_goals=canonical_match.away_goals,
                 ht_home_goals=canonical_match.ht_home_goals,
@@ -161,6 +167,8 @@ class MatchIngestService:
                 existing_match_by_signature,
                 status=canonical_match.status.value,
                 venue_id=venue_id,
+                home_team_id=home_team_id if home_team_id != existing_match_by_signature.home_team_id else None,
+                away_team_id=away_team_id if away_team_id != existing_match_by_signature.away_team_id else None,
                 home_goals=canonical_match.home_goals,
                 away_goals=canonical_match.away_goals,
                 ht_home_goals=canonical_match.ht_home_goals,

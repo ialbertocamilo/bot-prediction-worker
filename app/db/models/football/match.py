@@ -1,5 +1,5 @@
 from sqlalchemy import (
-    String, Integer, DateTime, ForeignKey, func, Index, CheckConstraint, UniqueConstraint
+    Boolean, String, Integer, DateTime, ForeignKey, func, Index, CheckConstraint, UniqueConstraint
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -45,6 +45,13 @@ class Match(Base):
     round: Mapped[str | None] = mapped_column(String(80), nullable=True)
     referee: Mapped[str | None] = mapped_column(String(120), nullable=True)
 
+    is_finished: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false"
+    )
+    processed_for_training: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false"
+    )
+
     created_at: Mapped[object] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
@@ -68,4 +75,6 @@ class Match(Base):
         Index("ix_matches_pair_date", "home_team_id", "away_team_id", "utc_date"),
         Index("ix_matches_league_status_date", "league_id", "status", "utc_date"),
         Index("ix_matches_status_date", "status", "utc_date"),
+        Index("ix_matches_is_finished", "is_finished"),
+        Index("ix_matches_processed_for_training", "processed_for_training"),
     )

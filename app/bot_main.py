@@ -83,6 +83,10 @@ _CACHE_MAX_ENTRIES = 200
 
 _matches_cache: dict[int, tuple[float, list[Match]]] = {}
 
+# Per-chat state: waiting for odds input after /predict
+# chat_id → {"match_id": int, "result": MatchPredictionResult}
+_awaiting_odds: dict[int, dict] = {}
+
 
 def _cache_get(chat_id: int) -> list[Match] | None:
     entry = _matches_cache.get(chat_id)
@@ -254,6 +258,24 @@ async def _callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     elif data.startswith("league_"):
         idx = int(data.split("_", 1)[1])
         await _do_matches(query.message, context, canonical_index=idx)
+    elif data.startswith("odds_"):
+        match_id_str = data.split("_", 1)[1]
+        chat_id = query.message.chat_id
+        pending = _awaiting_odds.get(chat_id)
+        if pending and str(pending["match_id"]) == match_id_str:
+            await _safe_edit_or_send(
+                query.message,
+                "📝 <b>Ingresa las cuotas de tu casa de apuestas</b>\n\n"
+                "Envía los 3 valores separados por espacios:\n"
+                "<code>cuota_local cuota_empate cuota_visitante</code>\n\n"
+                "<i>Ejemplo: 1.85 3.40 4.50</i>",
+                parse_mode="HTML",
+            )
+        else:
+            await _safe_edit_or_send(
+                query.message,
+                "⚠️ Predicción expirada. Usa /predict de nuevo.",
+            )
 
 
 async def _safe_edit_or_send(message, text: str, **kwargs) -> None:
@@ -601,8 +623,17 @@ async def cmd_predict(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
             return
 
+        # Store result so user can later provide odds
+        _awaiting_odds[chat_id] = {"match_id": match_id, "result": result}
+
         text = _format_prediction(result)
-        await _safe_reply(update, text, parse_mode="HTML")
+        odds_btn = InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                "💰 Ingresar cuotas de casa de apuestas",
+                callback_data=f"odds_{match_id}",
+            )],
+        ])
+        await _safe_reply(update, text, parse_mode="HTML", reply_markup=odds_btn)
     except Exception:
         logger.exception("Error en /predict %s (match_id=%s)", choice, match_id)
         await _safe_reply(
@@ -615,7 +646,7 @@ async def cmd_predict(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 def _format_prediction(result) -> str:
-    """Build a professional HTML-formatted prediction message."""
+    """Build a clean, user-focused prediction message."""
     home = _esc(result.home_team)
     away = _esc(result.away_team)
     p_h = result.p_home
@@ -658,15 +689,6 @@ def _format_prediction(result) -> str:
         f"    ✈️ {away}  <b>{_pct(p_a)}</b>  {'▓' * bar_a}{'░' * (20 - bar_a)}"
     )
 
-    # ── xG ──
-    xg_h = result.xg_home or 0
-    xg_a = result.xg_away or 0
-    if xg_h or xg_a:
-        lines.append(
-            f"\n📈 <b>Goles Esperados (xG)</b>\n"
-            f"    {home} <b>{xg_h:.2f}</b>  —  <b>{xg_a:.2f}</b> {away}"
-        )
-
     # ── Over/Under ──
     ou_parts: list[str] = []
     if result.p_over_1_5 is not None:
@@ -686,24 +708,106 @@ def _format_prediction(result) -> str:
             f"No <b>{_pct(result.p_btts_no)}</b>"
         )
 
-    # ── Double chance ──
-    lines.append(
-        f"\n🔄 <b>Doble Oportunidad</b>\n"
-        f"    {home} o Empate <b>{_pct(result.p_1x)}</b>\n"
-        f"    {away} o Empate <b>{_pct(result.p_x2)}</b>\n"
-        f"    {home} o {away} <b>{_pct(result.p_12)}</b>"
-    )
-
     # ── Top scorelines ──
     top = result.top_scorelines
     if top:
-        scores = [f"<b>{s}</b> ({p}%)" for s, p in list(top.items())[:5]]
+        scores = [f"<b>{s}</b> ({p}%)" for s, p in list(top.items())[:3]]
         lines.append(f"\n🥅 <b>Marcadores más probables</b>\n    {', '.join(scores)}")
 
-    # ── Footer ──
     lines.append("━━━━━━━━━━━━━━━━━━━━━")
-    quality = result.data_quality or ""
-    lines.append(f"<i>ℹ️ {quality}\n🔮 Modelo: Dixon-Coles · Calibración Platt</i>")
+    lines.append("<i>💡 Toca el botón de abajo para analizar con tus cuotas.</i>")
+
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:3950] + "\n..."
+    return text
+
+
+def _format_stake_analysis(
+    result,
+    home_odds: float,
+    draw_odds: float,
+    away_odds: float,
+) -> str:
+    """Build the stake analysis message after user provides odds."""
+    from app.services.prediction.value_service import odds_to_probs
+
+    home = _esc(result.home_team)
+    away = _esc(result.away_team)
+
+    market = odds_to_probs(home_odds, draw_odds, away_odds)
+
+    outcomes = [
+        ("1", home, result.p_home, home_odds, market["p_home"]),
+        ("X", "Empate", result.p_draw, draw_odds, market["p_draw"]),
+        ("2", away, result.p_away, away_odds, market["p_away"]),
+    ]
+
+    lines = [
+        "━━━━━━━━━━━━━━━━━━━━━",
+        f"💰 <b>Análisis de Cuotas</b>",
+        f"⚽ {home} vs {away}",
+        f"📊 Cuotas: <b>{home_odds:.2f}</b> / <b>{draw_odds:.2f}</b> / <b>{away_odds:.2f}</b>",
+        f"📉 Margen casa: <b>{market['margin'] * 100:.1f}%</b>",
+        "━━━━━━━━━━━━━━━━━━━━━",
+    ]
+
+    best_edge = -999.0
+    best_label = ""
+
+    for code, label, model_p, odds, market_p in outcomes:
+        ks = compute_kelly_stake(model_p, odds)
+        edge = ks["edge"]
+        stake_pct = ks["recommended_stake_percent"]
+        rating = compute_stake_rating(stake_pct)
+        stake_bar = "🟢" * rating + "⚪" * (10 - rating)
+
+        edge_sign = "+" if edge > 0 else ""
+        value_tag = " ✅ VALOR" if edge > 0.03 else ""
+
+        lines.append(
+            f"\n<b>{code} — {label}</b>  @{odds:.2f}\n"
+            f"    Modelo: <b>{_pct(model_p)}</b> vs Casa: <b>{_pct(market_p)}</b>\n"
+            f"    📈 Edge: <b>{edge_sign}{edge * 100:.1f}%</b>{value_tag}\n"
+            f"    🎯 Stake: {stake_bar} <b>{rating}/10</b>"
+        )
+        if stake_pct > 0:
+            lines.append(f"    💵 Apostar: <b>{stake_pct * 100:.2f}%</b> del bankroll")
+
+        if edge > best_edge:
+            best_edge = edge
+            best_label = f"{code} ({label})"
+
+    lines.append("\n━━━━━━━━━━━━━━━━━━━━━")
+    if best_edge > 0.03:
+        lines.append(
+            f"\n🏆 <b>Mejor apuesta: {best_label}</b>\n"
+            f"    Edge: <b>+{best_edge * 100:.1f}%</b> sobre la casa"
+        )
+    elif best_edge > 0:
+        lines.append(
+            f"\n⚠️ <b>Edge pequeño en {best_label}</b> ({best_edge * 100:.1f}%)\n"
+            f"    Considerar con precaución."
+        )
+    else:
+        lines.append(
+            "\n❌ <b>Sin valor detectado</b>\n"
+            "    Las cuotas no ofrecen ventaja. Mejor pasar."
+        )
+
+    # Glossary
+    lines.append(
+        "\n━━━━━━━━━━━━━━━━━━━━━"
+        "\n📖 <b>¿Qué significa cada dato?</b>\n"
+        "  📈 <b>Edge</b> — Ventaja del modelo sobre la casa de apuestas. "
+        "Si es positivo, la cuota paga más de lo que debería.\n"
+        "  🎯 <b>Stake</b> — Cuánto apostar según el criterio de Kelly. "
+        "Más 🟢 = más confianza en la apuesta.\n"
+        "  📉 <b>Margen casa</b> — Comisión implícita de la casa. "
+        "Cuanto menor, mejores cuotas te ofrecen.\n"
+        "  ✅ <b>VALOR</b> — Aparece cuando el edge supera 3%, "
+        "indicando una apuesta con ventaja real."
+    )
 
     text = "\n".join(lines)
     if len(text) > 4000:
@@ -851,7 +955,47 @@ async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> 
 # ── Fallback for free text ────────────────────────────────────────────────
 
 async def _fallback_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle any non-command text message by guiding user to the menu."""
+    """Handle free text: odds input or fallback to menu."""
+    chat_id = update.effective_chat.id
+    text = (update.message.text or "").strip()
+
+    # Check if user is providing odds
+    pending = _awaiting_odds.get(chat_id)
+    if pending:
+        parts = text.replace(",", ".").split()
+        if len(parts) == 3:
+            try:
+                h_odds = float(parts[0])
+                d_odds = float(parts[1])
+                a_odds = float(parts[2])
+                if h_odds < 1.01 or d_odds < 1.01 or a_odds < 1.01:
+                    raise ValueError("Odds must be > 1.0")
+                if h_odds > 1000 or d_odds > 1000 or a_odds > 1000:
+                    raise ValueError("Odds unreasonably high")
+            except ValueError:
+                await _safe_reply(
+                    update,
+                    "⚠️ Formato inválido. Las cuotas deben ser números mayores a 1.0\n"
+                    "<i>Ejemplo: 1.85 3.40 4.50</i>",
+                    parse_mode="HTML",
+                )
+                return
+
+            result = pending["result"]
+            _awaiting_odds.pop(chat_id, None)
+
+            # Send prediction + stake analysis together so match info stays visible
+            prediction_text = _format_prediction(result)
+            analysis = _format_stake_analysis(result, h_odds, d_odds, a_odds)
+            combined = prediction_text + "\n\n" + analysis
+            if len(combined) > 4000:
+                # If too long, send as two separate messages
+                await _safe_reply(update, prediction_text, parse_mode="HTML")
+                await _safe_reply(update, analysis, parse_mode="HTML", reply_markup=_main_menu_keyboard())
+            else:
+                await _safe_reply(update, combined, parse_mode="HTML", reply_markup=_main_menu_keyboard())
+            return
+
     await _safe_reply(
         update,
         "🤖 No entendí ese mensaje.\n\n"

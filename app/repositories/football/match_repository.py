@@ -53,6 +53,7 @@ class MatchRepository:
             venue_id=venue_id,
             utc_date=utc_date,
             status=status,
+            is_finished=status == "FINISHED",
             home_team_id=home_team_id,
             away_team_id=away_team_id,
             home_goals=home_goals,
@@ -73,6 +74,8 @@ class MatchRepository:
         *,
         status: str | None = None,
         venue_id: int | None = None,
+        home_team_id: int | None = None,
+        away_team_id: int | None = None,
         home_goals: int | None = None,
         away_goals: int | None = None,
         ht_home_goals: int | None = None,
@@ -82,8 +85,14 @@ class MatchRepository:
     ) -> Match:
         if status is not None:
             match.status = status
+            match.is_finished = status == "FINISHED"
         if venue_id is not None:
             match.venue_id = venue_id
+
+        if home_team_id is not None:
+            match.home_team_id = home_team_id
+        if away_team_id is not None:
+            match.away_team_id = away_team_id
 
         if home_goals is not None:
             match.home_goals = home_goals
