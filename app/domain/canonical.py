@@ -38,6 +38,7 @@ class CanonicalTeam(CanonicalBase):
     short_name: str | None = None
     country: str | None = None
     founded_year: int | None = None
+    crest_url: str | None = None
 
 
 class CanonicalVenue(CanonicalBase):
@@ -58,6 +59,9 @@ class CanonicalMatch(CanonicalBase):
 
     home_team_external_id: str | None = None
     away_team_external_id: str | None = None
+
+    home_team_crest_url: str | None = None
+    away_team_crest_url: str | None = None
 
     home_goals: int | None = None
     away_goals: int | None = None

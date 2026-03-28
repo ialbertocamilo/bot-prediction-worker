@@ -69,6 +69,8 @@ class ApiFootballMapper:
             away_team_name=teams["away"]["name"],
             home_team_external_id=str(teams["home"]["id"]),
             away_team_external_id=str(teams["away"]["id"]),
+            home_team_crest_url=teams["home"].get("logo"),
+            away_team_crest_url=teams["away"].get("logo"),
             home_goals=goals.get("home"),
             away_goals=goals.get("away"),
             ht_home_goals=halftime.get("home"),
@@ -110,6 +112,7 @@ class ApiFootballMapper:
             short_name=team_data.get("code"),
             country=team_data.get("country"),
             founded_year=team_data.get("founded"),
+            crest_url=team_data.get("logo"),
         )
 
     @staticmethod

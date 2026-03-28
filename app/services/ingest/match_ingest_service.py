@@ -105,12 +105,14 @@ class MatchIngestService:
             source_id=source.id,
             external_team_id=canonical_match.home_team_external_id,
             team_name=canonical_match.home_team_name,
+            crest_url=canonical_match.home_team_crest_url,
         )
 
         away_team_id: int = self._resolve_team(
             source_id=source.id,
             external_team_id=canonical_match.away_team_external_id,
             team_name=canonical_match.away_team_name,
+            crest_url=canonical_match.away_team_crest_url,
         )
 
         # Stamp domestic_league_key on-the-fly for domestic leagues
@@ -245,6 +247,7 @@ class MatchIngestService:
         source_id: int,
         external_team_id: str | None,
         team_name: str,
+        crest_url: str | None = None,
     ) -> int:
         if external_team_id is not None:
             existing_mapping = self.external_id_repo.find_mapping(
@@ -253,6 +256,11 @@ class MatchIngestService:
                 external_id=external_team_id,
             )
             if existing_mapping is not None:
+                # Stamp crest_url on existing team if missing
+                if crest_url:
+                    team = self.team_repo.get_by_id(existing_mapping.canonical_id)
+                    if team and not team.crest_url:
+                        team.crest_url = crest_url
                 return existing_mapping.canonical_id
 
         existing_team = self.team_repo.find_by_name_fuzzy(
@@ -266,7 +274,10 @@ class MatchIngestService:
                 short_name=None,
                 country=None,
                 founded_year=None,
+                crest_url=crest_url,
             )
+        elif crest_url and not existing_team.crest_url:
+            existing_team.crest_url = crest_url
 
         if external_team_id is not None:
             self.external_id_repo.get_or_create_mapping(

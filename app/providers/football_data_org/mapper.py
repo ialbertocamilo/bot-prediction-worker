@@ -76,6 +76,8 @@ class FootballDataOrgMapper:
             away_team_name=away.get("name", "Unknown"),
             home_team_external_id=str(home["id"]) if home.get("id") else None,
             away_team_external_id=str(away["id"]) if away.get("id") else None,
+            home_team_crest_url=home.get("crest"),
+            away_team_crest_url=away.get("crest"),
             home_goals=full_time.get("home"),
             away_goals=full_time.get("away"),
             ht_home_goals=half_time.get("home"),
@@ -98,6 +100,7 @@ class FootballDataOrgMapper:
             short_name=raw.get("tla"),
             country=raw.get("area", {}).get("name"),
             founded_year=raw.get("founded"),
+            crest_url=raw.get("crest"),
         )
 
     # ── League / Competition ────────────────────────────────────

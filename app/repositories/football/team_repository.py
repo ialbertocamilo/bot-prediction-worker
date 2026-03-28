@@ -71,12 +71,14 @@ class TeamRepository:
         short_name: str | None = None,
         country: str | None = None,
         founded_year: int | None = None,
+        crest_url: str | None = None,
     ) -> Team:
         team: Team = Team(
             name=name,
             short_name=short_name,
             country=country,
             founded_year=founded_year,
+            crest_url=crest_url,
         )
         self.db.add(team)
         self.db.flush()
@@ -89,9 +91,14 @@ class TeamRepository:
         short_name: str | None = None,
         country: str | None = None,
         founded_year: int | None = None,
+        crest_url: str | None = None,
     ) -> Team:
         team: Team | None = self.find_by_name_country(name=name, country=country)
         if team is not None:
+            # Update crest_url if missing and we have one now
+            if crest_url and not team.crest_url:
+                team.crest_url = crest_url
+                self.db.flush()
             return team
 
         return self.create(
@@ -99,6 +106,7 @@ class TeamRepository:
             short_name=short_name,
             country=country,
             founded_year=founded_year,
+            crest_url=crest_url,
         )
 
     def search_by_name(self, query: str, limit: int = 20) -> list[Team]:

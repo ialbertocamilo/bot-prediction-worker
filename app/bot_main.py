@@ -29,7 +29,7 @@ from datetime import datetime, timezone as _tz
 
 from dotenv import load_dotenv
 from sqlalchemy.orm import Session
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
 from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
 from telegram.ext import (
     Application,
@@ -626,6 +626,32 @@ async def cmd_predict(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         # Store result so user can later provide odds
         _awaiting_odds[chat_id] = {"match_id": match_id, "result": result}
 
+        # Send team badges if available
+        match_db = db.get(Match, match_id)
+        home_crest = (
+            match_db.home_team.crest_url
+            if match_db and match_db.home_team else None
+        )
+        away_crest = (
+            match_db.away_team.crest_url
+            if match_db and match_db.away_team else None
+        )
+        if home_crest and away_crest:
+            try:
+                await update.message.reply_media_group(
+                    media=[
+                        InputMediaPhoto(media=home_crest),
+                        InputMediaPhoto(media=away_crest),
+                    ],
+                )
+            except Exception:
+                logger.debug("Could not send team badges")
+        elif home_crest or away_crest:
+            try:
+                await update.message.reply_photo(photo=home_crest or away_crest)
+            except Exception:
+                logger.debug("Could not send team badge")
+
         text = _format_prediction(result)
         odds_btn = InlineKeyboardMarkup([
             [InlineKeyboardButton(
@@ -707,6 +733,14 @@ def _format_prediction(result) -> str:
             f"    Sí <b>{_pct(result.p_btts_yes)}</b>  ·  "
             f"No <b>{_pct(result.p_btts_no)}</b>"
         )
+
+    # ── Double Chance ──
+    lines.append(
+        f"\n🔄 <b>Doble Oportunidad</b>\n"
+        f"    1X — {home} o Empate: <b>{_pct(result.p_1x)}</b>\n"
+        f"    X2 — {away} o Empate: <b>{_pct(result.p_x2)}</b>\n"
+        f"    12 — {home} o {away}: <b>{_pct(result.p_12)}</b>"
+    )
 
     # ── Top scorelines ──
     top = result.top_scorelines

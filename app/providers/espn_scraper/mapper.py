@@ -14,6 +14,8 @@ from app.domain.enums import EventType, MatchStatus
 
 SOURCE_NAME = "espn-scraper"
 
+_ESPN_LOGO_TPL = "https://a.espncdn.com/i/teamlogos/soccer/500/{}.png"
+
 
 class EspnScraperMapper:
     """Convierte respuestas de ESPN Soccer API → modelos canónicos."""
@@ -99,6 +101,14 @@ class EspnScraperMapper:
             away_team_name=away_team.get("displayName", away_team.get("name", "Unknown")),
             home_team_external_id=home_team.get("id"),
             away_team_external_id=away_team.get("id"),
+            home_team_crest_url=(
+                home_team.get("logo")
+                or (_ESPN_LOGO_TPL.format(home_team["id"]) if home_team.get("id") else None)
+            ),
+            away_team_crest_url=(
+                away_team.get("logo")
+                or (_ESPN_LOGO_TPL.format(away_team["id"]) if away_team.get("id") else None)
+            ),
             home_goals=home_goals,
             away_goals=away_goals,
             ht_home_goals=None,  # ESPN no provee half-time en plan básico
@@ -123,6 +133,10 @@ class EspnScraperMapper:
             short_name=team.get("abbreviation"),
             country=None,  # ESPN no provee país directamente en standings
             founded_year=None,
+            crest_url=(
+                team.get("logo")
+                or (_ESPN_LOGO_TPL.format(team["id"]) if team.get("id") else None)
+            ),
         )
 
     # ── League ──────────────────────────────────────────────────
