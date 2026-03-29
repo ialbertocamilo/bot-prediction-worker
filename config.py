@@ -40,3 +40,14 @@ CALIBRATION_ENABLED = os.getenv("CALIBRATION_ENABLED", "true").lower() in ("true
 # Minimum evaluated predictions required before Platt calibration kicks in.
 # Lowered to 30 to allow early-season calibration (Jornada 10-12).
 CALIBRATION_MIN_SAMPLES = int(os.getenv("CALIBRATION_MIN_SAMPLES", "30"))
+
+# ── App Base URL (ngrok / dominio público) ───────────────────────────────
+# Requerido por los providers de pago para notification_url y back_urls.
+_raw_base_url = os.getenv("APP_BASE_URL", "").rstrip("/")
+if not _raw_base_url:
+    raise RuntimeError(
+        "FATAL: APP_BASE_URL no configurada en .env — "
+        "los webhooks de Mercado Pago y PayPal no funcionarán. "
+        "Ejemplo: APP_BASE_URL=https://tu-subdominio.ngrok-free.dev"
+    )
+APP_BASE_URL: str = _raw_base_url

@@ -1,4 +1,4 @@
-from app.repositories.core import SourceRepository, ExternalIdRepository, RawRecordRepository
+from app.repositories.core import SourceRepository, ExternalIdRepository, RawRecordRepository, UserRepository, PaymentRepository
 from app.repositories.football import (
     LeagueRepository,
     SeasonRepository,
@@ -21,6 +21,8 @@ __all__ = [
     "SourceRepository",
     "ExternalIdRepository",
     "RawRecordRepository",
+    "UserRepository",
+    "PaymentRepository",
     "LeagueRepository",
     "SeasonRepository",
     "TeamRepository",

@@ -1,0 +1,24 @@
+==================================================
+DIAGNÓSTICO MERCADO PAGO
+==================================================
+
+1. ACCESS_TOKEN: ...3298970436
+2. WEBHOOK_BASE_URL: https://oniony-jaxton-olericulturally.ngrok-free.dev
+3. SANDBOX: true
+
+--- Test credenciales (search payments) ---
+Status: 200
+Pagos en últimos 7 días: 0
+
+--- Test crear preference ---
+Status: 201
+Preference ID: 3298970436-921bbcce-b9a6-4456-b6f5-d587c16aa7e8
+init_point: https://www.mercadopago.com.pe/checkout/v1/redirect?pref_id=3298970436-921bbcce-b9a6-4456-b6f5-d587c16aa7e8
+sandbox_init_point: https://sandbox.mercadopago.com.pe/checkout/v1/redirect?pref_id=3298970436-921bbcce-b9a6-4456-b6f5-d587c16aa7e8
+notification_url: https://oniony-jaxton-olericulturally.ngrok-free.dev/payments/webhook
+
+--- Test webhook URL ---
+GET https://oniony-jaxton-olericulturally.ngrok-free.dev/payments/result?status=test → 200 {"status":"test","message":"Vuelve al bot de Telegram."}
+
+==================================================
+FIN DIAGNÓSTICO

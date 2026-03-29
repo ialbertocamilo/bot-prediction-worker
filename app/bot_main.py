@@ -49,6 +49,15 @@ from app.services.canonical_league_service import (
 )
 from app.services.prediction.prediction_service import PredictionService
 from app.services.prediction.value_service import ValueService, compute_kelly_stake, compute_stake_rating
+from app.services.payments import (
+    Gateway,
+    MercadoPagoProvider,
+    PayPalProvider,
+    PaymentFactory,
+    PaymentService,
+)
+from app.services.payments.payment_service import CREDITS_PER_PURCHASE
+from app.repositories.core.user_repository import UserRepository
 
 load_dotenv()
 
@@ -172,6 +181,7 @@ def _main_menu_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("📅 Partidos de hoy", callback_data="menu_matches"),
         ],
         [
+            InlineKeyboardButton("💳 Comprar créditos", callback_data="menu_comprar"),
             InlineKeyboardButton("❓ Ayuda", callback_data="menu_help"),
         ],
     ])
@@ -246,6 +256,12 @@ async def _callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await _do_matches(query.message, context, canonical_index=None)
     elif data == "menu_valuebets":
         await _do_valuebets(query.message, context)
+    elif data == "menu_comprar":
+        await _do_comprar_gateway_select(query, context)
+    elif data == "menu_comprar_mp":
+        await _do_comprar_checkout(query, context, Gateway.MERCADOPAGO)
+    elif data == "menu_comprar_paypal":
+        await _do_comprar_checkout(query, context, Gateway.PAYPAL)
     elif data == "menu_help":
         msg = (
             "📖 <b>Guía Rápida</b>\n\n"
@@ -576,7 +592,15 @@ async def _do_matches(
 # ── /predict ──────────────────────────────────────────────────────────────
 
 async def cmd_predict(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Predict the match selected by number from /matches."""
+    """Predict the match selected by number from /matches.
+
+    Credit flow:
+      1. SELECT … FOR UPDATE → lock user row
+      2. Fail-fast if creditos <= 0
+      3. Run prediction (heavy CPU work)
+      4. On success → deduct 1 credit, COMMIT
+      5. On failure → ROLLBACK (no charge)
+    """
     if not context.args:
         await _safe_reply(
             update,
@@ -606,24 +630,87 @@ async def cmd_predict(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     match_obj = cached[choice - 1]
-    match_id = match_obj.id
+    match_id: int = match_obj.id
+    user = update.effective_user
+    if not user:
+        return
+    telegram_id: int = user.id
 
-    await _safe_reply(update, "🔄 Calculando predicción...")
-
+    # ── 1. Validación de créditos con bloqueo de fila ─────────────────
     db = _db()
     try:
-        service = PredictionService(db)
-        result = service.predict_match(match_id)
+        user_repo = UserRepository(db)
+        user_row = user_repo.get_for_update(telegram_id)
 
-        if result is None:
+        if user_row is None:
+            user_repo.get_or_create(telegram_id=telegram_id, username=user.username)
+            user_row = user_repo.get_for_update(telegram_id)
+
+        if user_row is None or user_row.creditos <= 0:
+            db.rollback()
+            buy_link: str = ""
+            try:
+                provider = PaymentFactory.create(Gateway.MERCADOPAGO)
+                pay_svc = PaymentService(_db(), provider)
+                buy_link = await pay_svc.create_checkout(telegram_id)
+            except Exception:
+                logger.debug("Could not generate payment link for insufficient-credits msg")
+
+            link_text: str = buy_link if buy_link else "/comprar"
             await _safe_reply(
                 update,
-                "⚠️ No se pudo generar predicción.\n"
-                "Datos históricos insuficientes (mínimo 30 partidos).",
+                "⚠️ Saldo insuficiente para ejecutar la predicción. "
+                f"Compra más créditos aquí: {link_text}",
             )
             return
 
-        # Store result so user can later provide odds
+        # ── 2. Ejecutar predicción (CPU-heavy) ───────────────────────
+        await _safe_reply(update, "🔄 Calculando predicción...")
+
+        result = None
+        try:
+            service = PredictionService(db)
+            result = service.predict_match(match_id)
+        except Exception:
+            logger.exception("Error en /predict %s (match_id=%s)", choice, match_id)
+            db.rollback()
+            await _safe_reply(
+                update,
+                "⚠️ El motor de predicción falló. No se descontaron créditos.\n"
+                "Intenta de nuevo en unos minutos.",
+            )
+            return
+
+        if result is None:
+            db.rollback()
+            await _safe_reply(
+                update,
+                "⚠️ No se pudo generar predicción.\n"
+                "Datos históricos insuficientes (mínimo 30 partidos).\n"
+                "No se descontaron créditos.",
+            )
+            return
+
+        # ── 3. Predicción exitosa → descontar 1 crédito y commit ─────
+        try:
+            new_balance: int = user_repo.deduct_credito(telegram_id)
+            db.commit()
+        except Exception:
+            logger.exception("DB error deducting credit for tg_id=%d", telegram_id)
+            db.rollback()
+            await _safe_reply(
+                update,
+                "⚠️ Error interno al descontar créditos. No se realizó el cobro.\n"
+                "Intenta de nuevo.",
+            )
+            return
+
+        logger.info(
+            "/predict tg_id=%d match=%d → -1 crédito (balance=%d)",
+            telegram_id, match_id, new_balance,
+        )
+
+        # ── 4. Enviar resultado al usuario ────────────────────────────
         _awaiting_odds[chat_id] = {"match_id": match_id, "result": result}
 
         # Send team badges if available
@@ -653,18 +740,22 @@ async def cmd_predict(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 logger.debug("Could not send team badge")
 
         text = _format_prediction(result)
+        credit_footer: str = f"\n\n💰 Créditos restantes: <b>{new_balance}</b>"
         odds_btn = InlineKeyboardMarkup([
             [InlineKeyboardButton(
                 "💰 Ingresar cuotas de casa de apuestas",
                 callback_data=f"odds_{match_id}",
             )],
         ])
-        await _safe_reply(update, text, parse_mode="HTML", reply_markup=odds_btn)
+        await _safe_reply(
+            update, text + credit_footer, parse_mode="HTML", reply_markup=odds_btn,
+        )
     except Exception:
-        logger.exception("Error en /predict %s (match_id=%s)", choice, match_id)
+        logger.exception("Unhandled error in /predict %s (match_id=%s)", choice, match_id)
+        db.rollback()
         await _safe_reply(
             update,
-            "⚠️ El motor de predicción no pudo procesar la solicitud.\n"
+            "⚠️ Error inesperado. No se descontaron créditos.\n"
             "Intenta de nuevo en unos minutos.",
         )
     finally:
@@ -847,6 +938,123 @@ def _format_stake_analysis(
     if len(text) > 4000:
         text = text[:3950] + "\n..."
     return text
+
+
+# ── /comprar ──────────────────────────────────────────────────────────────
+
+def _gateway_selection_keyboard() -> InlineKeyboardMarkup:
+    """Inline keyboard with one button per available gateway."""
+    mp = PaymentFactory.create(Gateway.MERCADOPAGO)
+    pp = PaymentFactory.create(Gateway.PAYPAL)
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"🇵🇪 Mercado Pago — {mp.pricing.label}",
+            callback_data="menu_comprar_mp",
+        )],
+        [InlineKeyboardButton(
+            f"🌎 PayPal — {pp.pricing.label}",
+            callback_data="menu_comprar_paypal",
+        )],
+    ])
+
+
+async def _do_comprar_gateway_select(query, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show gateway selection buttons (inline callback)."""
+    await _safe_edit_or_send(
+        query.message,
+        f"🛒 <b>Comprar créditos</b>\n\n"
+        f"📦 <b>{CREDITS_PER_PURCHASE} créditos</b>\n\n"
+        f"Elige tu método de pago:",
+        parse_mode="HTML",
+        reply_markup=_gateway_selection_keyboard(),
+    )
+
+
+async def _do_comprar_checkout(
+    query,
+    context: ContextTypes.DEFAULT_TYPE,
+    gateway: Gateway,
+) -> None:
+    """Generate a checkout link for the chosen gateway (inline callback)."""
+    user = query.from_user
+    if not user:
+        return
+    db = _db()
+    try:
+        provider = PaymentFactory.create(gateway)
+        svc = PaymentService(db, provider)
+        init_point: str = await svc.create_checkout(user.id)
+        if not init_point:
+            await _safe_edit_or_send(
+                query.message,
+                "⚠️ No se pudo generar el link de pago.",
+            )
+            return
+        pricing = provider.pricing
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                f"💳 Pagar {pricing.label} → {CREDITS_PER_PURCHASE} créditos",
+                url=init_point,
+            )],
+        ])
+        await _safe_edit_or_send(
+            query.message,
+            f"🛒 <b>Comprar créditos</b>\n\n"
+            f"📦 <b>{CREDITS_PER_PURCHASE} créditos</b> por "
+            f"<b>{pricing.label}</b>\n\n"
+            f"Toca el botón para ir a pagar.",
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+    except Exception:
+        logger.exception("Error en menu_comprar_%s callback", gateway.value)
+        await _safe_edit_or_send(
+            query.message,
+            "⚠️ Error al conectar con la pasarela de pago.",
+        )
+    finally:
+        db.close()
+
+
+async def cmd_comprar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Muestra la selección de pasarela de pago (/comprar)."""
+    user = update.effective_user
+    if not user:
+        return
+
+    await _safe_reply(
+        update,
+        f"🛒 <b>Comprar créditos</b>\n\n"
+        f"📦 <b>{CREDITS_PER_PURCHASE} créditos</b>\n\n"
+        f"Elige tu método de pago:",
+        parse_mode="HTML",
+        reply_markup=_gateway_selection_keyboard(),
+    )
+
+
+# ── /creditos ─────────────────────────────────────────────────────────────
+
+async def cmd_creditos(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Muestra el saldo de créditos del usuario."""
+    user = update.effective_user
+    if not user:
+        return
+
+    db = _db()
+    try:
+        repo = UserRepository(db)
+        balance: int = repo.get_creditos(user.id)
+        await _safe_reply(
+            update,
+            f"💰 <b>Tus créditos:</b> {balance}\n\n"
+            f"Usa /comprar para adquirir más.",
+            parse_mode="HTML",
+        )
+    except Exception:
+        logger.exception("Error en /creditos para user %s", user.id)
+        await _safe_reply(update, "⚠️ Error al consultar créditos.")
+    finally:
+        db.close()
 
 
 # ── /valuebets ────────────────────────────────────────────────────────────
@@ -1097,6 +1305,8 @@ def main() -> None:
     app.add_handler(CommandHandler("matches", cmd_matches))
     app.add_handler(CommandHandler("predict", cmd_predict))
     app.add_handler(CommandHandler("valuebets", cmd_valuebets))
+    app.add_handler(CommandHandler("comprar", cmd_comprar))
+    app.add_handler(CommandHandler("creditos", cmd_creditos))
 
     # Inline button handler (main menu + league selection)
     app.add_handler(CallbackQueryHandler(_callback_handler))

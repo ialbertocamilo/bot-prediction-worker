@@ -1,0 +1,7 @@
+=== COMPRADOR DE PRUEBA (MPE) ===
+HTTP Status: 201
+Email: test_user_4356892784498155536@testuser.com
+Password: po7v5fRYcW
+User ID: 3296800276
+Nickname: TESTUSER4356892784498155536
+Site: 
