@@ -1,70 +1,23 @@
-"""Payment webhooks — multi-gateway via Strategy Pattern."""
+"""Payment webhooks — multi-gateway (raw Request, anti-422 design)."""
 from __future__ import annotations
 
 import logging
 import os
+import traceback
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy.orm import Session
 
 from app.api.dependencies import get_db
-from app.services.payments.base import PaymentResult
+from app.db.models.core.payment import Payment
+from app.db.models.core.user import User
 from app.services.payments.mercadopago_provider import MercadoPagoProvider
 from app.services.payments.paypal_provider import PayPalProvider
-from app.services.payments.payment_service import (
-    CREDITS_PER_PURCHASE,
-    PaymentAlreadyProcessed,
-    PaymentNotApproved,
-    PaymentService,
-)
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
-
-_SANDBOX: bool = os.getenv("MP_SANDBOX", "true").lower() in ("true", "1", "yes")
-
-
-# ── Pydantic: esquema Webhooks v2 de Mercado Pago ─────────────────────
-
-
-class MPWebhookData(BaseModel):
-    """Sub-objeto ``data`` del webhook — contiene el ID del recurso."""
-
-    model_config = ConfigDict(extra="allow")
-
-    id: str = Field(..., description="Payment ID de Mercado Pago")
-    test_telegram_id: int | None = Field(
-        default=None,
-        description="(Solo sandbox) telegram_id para simular pago aprobado",
-    )
-
-    @field_validator("id", mode="before")
-    @classmethod
-    def coerce_id_to_str(cls, v: object) -> str:
-        return str(v)
-
-
-class MPWebhookPayload(BaseModel):
-    """Payload completo de un evento Webhooks v2 de Mercado Pago."""
-
-    model_config = ConfigDict(extra="allow")
-
-    action: str = Field(..., examples=["payment.created"])
-    api_version: str = Field("v1", examples=["v1"])
-    data: MPWebhookData
-    date_created: str = Field(..., examples=["2026-03-28T10:55:00.000-04:00"])
-    id: int = Field(..., description="ID de la notificación webhook")
-    live_mode: bool = Field(False)
-    type: str = Field(..., examples=["payment"])
-    user_id: str = Field(..., description="ID del vendedor en Mercado Pago")
-
-    @field_validator("user_id", mode="before")
-    @classmethod
-    def coerce_user_id_to_str(cls, v: object) -> str:
-        return str(v)
 
 
 # ── Mercado Pago webhook ─────────────────────────────────────────────
@@ -72,140 +25,186 @@ class MPWebhookPayload(BaseModel):
 
 @router.post("/webhook/mercadopago")
 async def mp_webhook(
-    payload: MPWebhookPayload,
+    request: Request,
     db: Session = Depends(get_db),
 ) -> JSONResponse:
     """Recibe notificaciones de Mercado Pago (Webhooks v2).
 
-    Delega la lógica de negocio a ``PaymentService`` con
-    ``MercadoPagoProvider`` como estrategia.
+    Parsea el body crudo para evitar errores 422 por esquema Pydantic.
     """
-    if "payment" not in payload.action and payload.type != "payment":
-        return JSONResponse({"ok": True}, status_code=200)
+    body = await request.body()
+    if body:
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+    else:
+        payload = {}
+    print(f"🔔 MP WEBHOOK RECIBIDO: {payload}")
 
-    payment_id: str = payload.data.id
+    payment_id = payload.get("data", {}).get("id") or payload.get("id") or request.query_params.get("id")
     if not payment_id:
-        return JSONResponse({"ok": True}, status_code=200)
+        print("⚠️ MP WEBHOOK: No se encontró payment_id — ignorando.")
+        return JSONResponse({"status": "ok"}, status_code=200)
+
+    payment_id = str(payment_id)
+    print(f"🔍 MP WEBHOOK: payment_id extraído = {payment_id}")
+
+    pago_existente = db.query(Payment).filter(Payment.mp_payment_id == payment_id).first()
+    if pago_existente:
+        print(f"⏳ [AUDITORÍA] Pago MP {payment_id} ya procesado. Ignorando.")
+        return JSONResponse({"status": "ok"}, status_code=200)
 
     try:
         provider = MercadoPagoProvider()
-        svc = PaymentService(db, provider)
+        result = await provider.verify_payment(payment_id)
 
-        # Sandbox simulation
-        simulated: PaymentResult | None = None
-        if _SANDBOX and payload.data.test_telegram_id is not None:
-            logger.info(
-                "MP webhook: SANDBOX sim → payment=%s tg_id=%d",
-                payment_id,
-                payload.data.test_telegram_id,
-            )
-            simulated = PaymentResult(
-                payment_id=payment_id,
-                status="approved",
-                external_reference=str(payload.data.test_telegram_id),
-                amount=float(provider.pricing.price),
-            )
+        if result.status != "approved":
+            print(f"⏳ MP WEBHOOK: Pago {payment_id} no aprobado (status={result.status}) — ignorando.")
+            return JSONResponse({"status": "ok"}, status_code=200)
 
-        new_balance: int = await svc.process_approved_payment(
-            payment_id, simulated=simulated,
-        )
-        return JSONResponse(
-            {"ok": True, "balance": new_balance}, status_code=200,
-        )
+        external_reference = result.external_reference
+        if not external_reference:
+            print(f"⚠️ MP WEBHOOK: Pago {payment_id} aprobado pero sin external_reference.")
+            return JSONResponse({"status": "ok"}, status_code=200)
 
-    except PaymentAlreadyProcessed:
-        return JSONResponse(
-            {"ok": True, "detail": "already_processed"}, status_code=200,
-        )
-    except PaymentNotApproved:
-        return JSONResponse({"ok": True}, status_code=200)
-    except ValueError as exc:
-        logger.warning("MP webhook: %s", exc)
-        return JSONResponse({"ok": True}, status_code=200)
-    except Exception:
-        logger.exception("MP webhook: error for payment %s", payment_id)
+        telegram_id = int(external_reference)
+        print(f"👤 MP WEBHOOK: telegram_id extraído = {telegram_id}")
+
+    except Exception as e:
+        print(f"❌ MP WEBHOOK: Error verificando pago {payment_id}:\n{traceback.format_exc()}")
+        return JSONResponse({"status": "ok"}, status_code=200)
+
+    try:
+        user = db.query(User).with_for_update().filter(User.telegram_id == telegram_id).first()
+        if not user:
+            print(f"⚠️ MP WEBHOOK: Usuario telegram_id={telegram_id} no encontrado en BD.")
+            return JSONResponse({"status": "ok"}, status_code=200)
+
+        user.creditos += 50
+        mp_currency = os.getenv("MP_ITEM_CURRENCY", "PEN")
+        db.add(Payment(
+            mp_payment_id=payment_id,
+            telegram_id=telegram_id,
+            amount=result.amount,
+            credits_granted=50,
+            status="approved",
+            currency=mp_currency,
+        ))
+        db.commit()
+        print(f"✅ ÉXITO MP: 50 CRÉDITOS SUMADOS A {telegram_id} — Saldo actual: {user.creditos}")
+
+    except Exception as e:
         db.rollback()
-        return JSONResponse({"ok": True}, status_code=200)
+        print(f"❌ MP WEBHOOK: Error en persistencia para {telegram_id}:\n{traceback.format_exc()}")
+
+    return JSONResponse({"status": "ok"}, status_code=200)
 
 
 # ── Legacy alias: keep /webhook working during migration ─────────────
 
 @router.post("/webhook")
 async def mp_webhook_legacy(
-    payload: MPWebhookPayload,
+    request: Request,
     db: Session = Depends(get_db),
 ) -> JSONResponse:
     """Alias for ``/webhook/mercadopago`` — backwards-compatible."""
-    return await mp_webhook(payload, db)
+    return await mp_webhook(request, db)
 
 
 # ── PayPal webhook ────────────────────────────────────────────────────
 
 
-class PayPalWebhookResource(BaseModel):
-    """Sub-objeto ``resource`` del evento PayPal (campos mínimos)."""
-
-    model_config = ConfigDict(extra="allow")
-
-    id: str = Field(..., description="Order / Capture ID")
-    status: str = Field("", description="COMPLETED, APPROVED, …")
-    custom_id: str | None = Field(None, description="telegram_id passed at order creation")
-
-    @field_validator("id", mode="before")
-    @classmethod
-    def coerce_id(cls, v: object) -> str:
-        return str(v)
-
-
-class PayPalWebhookPayload(BaseModel):
-    """Payload de un evento webhook de PayPal."""
-
-    model_config = ConfigDict(extra="allow")
-
-    id: str = Field(..., description="Webhook event ID")
-    event_type: str = Field(..., examples=["CHECKOUT.ORDER.APPROVED"])
-    resource: PayPalWebhookResource
-
-
 @router.post("/webhook/paypal")
 async def paypal_webhook(
-    payload: PayPalWebhookPayload,
+    request: Request,
     db: Session = Depends(get_db),
 ) -> JSONResponse:
     """Recibe notificaciones webhook de PayPal.
 
-    Events of interest: CHECKOUT.ORDER.APPROVED, PAYMENT.CAPTURE.COMPLETED.
+    Escucha CHECKOUT.ORDER.APPROVED, captura fondos y suma créditos.
     """
-    event = payload.event_type.upper()
-    if "APPROVED" not in event and "COMPLETED" not in event:
-        return JSONResponse({"ok": True}, status_code=200)
+    body = await request.body()
+    if body:
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+    else:
+        payload = {}
+    print(f"🔔 PAYPAL WEBHOOK RECIBIDO: {payload}")
 
-    order_id: str = payload.resource.id
-    if not order_id:
-        return JSONResponse({"ok": True}, status_code=200)
+    if payload.get("event_type") != "CHECKOUT.ORDER.APPROVED":
+        print(f"⏳ PAYPAL WEBHOOK: event_type={payload.get('event_type')} — ignorando.")
+        return JSONResponse({"status": "ok"}, status_code=200)
+
+    # Extraer telegram_id desde reference_id de purchase_units
+    reference_id = payload.get("resource", {}).get("purchase_units", [{}])[0].get("reference_id")
+    if not reference_id:
+        print("⚠️ PAYPAL WEBHOOK: No se encontró reference_id en purchase_units — ignorando.")
+        return JSONResponse({"status": "ok"}, status_code=200)
 
     try:
+        telegram_id = int(reference_id)
+    except (ValueError, TypeError):
+        print(f"⚠️ PAYPAL WEBHOOK: reference_id no es un entero válido: {reference_id}")
+        return JSONResponse({"status": "ok"}, status_code=200)
+
+    print(f"👤 PAYPAL WEBHOOK: telegram_id extraído = {telegram_id}")
+
+    order_id = payload.get("resource", {}).get("id")
+    if not order_id:
+        print("⚠️ PAYPAL WEBHOOK: No se encontró order_id en resource — ignorando.")
+        return JSONResponse({"status": "ok"}, status_code=200)
+
+    pago_existente = db.query(Payment).filter(Payment.mp_payment_id == str(order_id)).first()
+    if pago_existente:
+        print(f"⏳ [AUDITORÍA] Pago PayPal {order_id} ya procesado. Ignorando.")
+        return JSONResponse({"status": "ok"}, status_code=200)
+
+    # Capturar fondos de la orden
+    try:
         provider = PayPalProvider()
-        svc = PaymentService(db, provider)
+        result = await provider.verify_payment(str(order_id))
+        if result.status != "approved":
+            print(f"⚠️ PAYPAL WEBHOOK: Captura de orden {order_id} no aprobada (status={result.status}).")
+            return JSONResponse({"status": "ok"}, status_code=200)
+        print(f"✅ PAYPAL WEBHOOK: Orden {order_id} capturada exitosamente.")
+    except Exception as e:
+        print(f"❌ PAYPAL WEBHOOK: Error capturando orden {order_id}:\n{traceback.format_exc()}")
+        return JSONResponse({"status": "ok"}, status_code=200)
 
-        new_balance: int = await svc.process_approved_payment(order_id)
-        return JSONResponse(
-            {"ok": True, "balance": new_balance}, status_code=200,
-        )
+    try:
+        user = db.query(User).with_for_update().filter(User.telegram_id == telegram_id).first()
+        if not user:
+            print(f"⚠️ PAYPAL WEBHOOK: Usuario telegram_id={telegram_id} no encontrado en BD.")
+            return JSONResponse({"status": "ok"}, status_code=200)
 
-    except PaymentAlreadyProcessed:
-        return JSONResponse(
-            {"ok": True, "detail": "already_processed"}, status_code=200,
+        user.creditos += 50
+        paypal_amount = float(
+            payload.get("resource", {}).get("purchase_units", [{}])[0]
+            .get("amount", {}).get("value", "0")
         )
-    except PaymentNotApproved:
-        return JSONResponse({"ok": True}, status_code=200)
-    except ValueError as exc:
-        logger.warning("PayPal webhook: %s", exc)
-        return JSONResponse({"ok": True}, status_code=200)
-    except Exception:
-        logger.exception("PayPal webhook: error for order %s", order_id)
+        paypal_currency = (
+            payload.get("resource", {}).get("purchase_units", [{}])[0]
+            .get("amount", {}).get("currency_code", "USD")
+        )
+        db.add(Payment(
+            mp_payment_id=str(order_id),
+            telegram_id=telegram_id,
+            amount=paypal_amount,
+            credits_granted=50,
+            status="approved",
+            currency=paypal_currency,
+        ))
+        db.commit()
+        print(f"💰 [PAYPAL] ORDEN {order_id} CAPTURADA Y CRÉDITOS SUMADOS A {telegram_id}")
+
+    except Exception as e:
         db.rollback()
-        return JSONResponse({"ok": True}, status_code=200)
+        print(f"❌ PAYPAL WEBHOOK: Error en persistencia para {telegram_id}:\n{traceback.format_exc()}")
+
+    return JSONResponse({"status": "ok"}, status_code=200)
 
 
 # ── Back-URL de redirección ──────────────────────────────────────────

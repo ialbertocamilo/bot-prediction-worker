@@ -37,6 +37,12 @@ class Payment(Base):
         nullable=False,
     )
 
+    currency: Mapped[str] = mapped_column(
+        String(10),
+        nullable=False,
+        server_default="USD",
+    )
+
     created_at: Mapped[object] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
