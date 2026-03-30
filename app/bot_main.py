@@ -58,6 +58,7 @@ from app.services.payments import (
 )
 from app.services.payments.payment_service import CREDITS_PER_PURCHASE
 from app.repositories.core.user_repository import UserRepository
+from app.services.voucher_service import redeem_voucher
 
 load_dotenv()
 
@@ -1057,6 +1058,38 @@ async def cmd_creditos(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         db.close()
 
 
+# ── /canjear ──────────────────────────────────────────────────────────────
+
+async def cmd_canjear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Redeem a credit voucher: /canjear XXXX-XXXX-XXXX-XXXX"""
+    user = update.effective_user
+    if not user:
+        return
+
+    if not context.args:
+        await _safe_reply(update, "❌ Formato incorrecto. Uso: /canjear CODIGO")
+        return
+
+    codigo_limpio = context.args[0].strip().upper()
+
+    db = _db()
+    try:
+        creditos, nuevo_saldo = redeem_voucher(db=db, telegram_id=user.id, code=codigo_limpio)
+        await _safe_reply(
+            update,
+            f"✅ ¡Canje exitoso! Se sumaron <b>{creditos}</b> créditos a tu cuenta.\n"
+            f"Tu nuevo saldo es: <b>{nuevo_saldo}</b>",
+            parse_mode="HTML",
+        )
+    except ValueError as exc:
+        await _safe_reply(update, f"❌ Error al canjear: {exc}")
+    except Exception:
+        logger.exception("Error en /canjear para user %s", user.id)
+        await _safe_reply(update, "⚠️ Error inesperado al canjear el voucher.")
+    finally:
+        db.close()
+
+
 # ── /valuebets ────────────────────────────────────────────────────────────
 
 async def cmd_valuebets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1307,6 +1340,7 @@ def main() -> None:
     app.add_handler(CommandHandler("valuebets", cmd_valuebets))
     app.add_handler(CommandHandler("comprar", cmd_comprar))
     app.add_handler(CommandHandler("creditos", cmd_creditos))
+    app.add_handler(CommandHandler("canjear", cmd_canjear))
 
     # Inline button handler (main menu + league selection)
     app.add_handler(CallbackQueryHandler(_callback_handler))
