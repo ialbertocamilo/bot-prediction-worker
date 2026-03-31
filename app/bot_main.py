@@ -300,8 +300,8 @@ async def _callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 balance: int = repo.get_creditos(user.id)
                 await _safe_edit_or_send(
                     query.message,
-                    f"💰 <b>Tus créditos:</b> {balance}\n\n"
-                    f"Usa /comprar para adquirir más.",
+                    f"💰 <b>Tus créditos:</b> {balance}\n\n",
+                    # f"Usa /comprar para adquirir más.",
                     parse_mode="HTML",
                     reply_markup=_main_menu_keyboard(),
                 )
@@ -726,12 +726,12 @@ async def cmd_predict(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             except Exception:
                 logger.debug("Could not generate payment link for insufficient-credits msg")
 
-            link_text: str = buy_link if buy_link else "/comprar"
+            # link_text: str = buy_link if buy_link else "/comprar"
             await _safe_reply(
                 update,
                 f"⚠️ Saldo insuficiente. Necesitas <b>{PREDICTION_COST}</b> créditos "
-                f"(tienes <b>{user_row.creditos if user_row else 0}</b>).\n"
-                f"Compra más créditos aquí: {link_text}",
+                f"(tienes <b>{user_row.creditos if user_row else 0}</b>).\n",
+                # f"Compra más créditos aquí: {link_text}",
                 parse_mode="HTML",
             )
             return
@@ -1164,8 +1164,8 @@ async def cmd_creditos(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         balance: int = repo.get_creditos(user.id)
         await _safe_reply(
             update,
-            f"💰 <b>Tus créditos:</b> {balance}\n\n"
-            f"Usa /comprar para adquirir más.",
+            f"💰 <b>Tus créditos:</b> {balance}\n\n",
+            # f"Usa /comprar para adquirir más.",
             parse_mode="HTML",
         )
     except Exception:
