@@ -184,7 +184,7 @@ def _main_menu_keyboard() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton("💰 Mi Saldo", callback_data="menu_saldo"),
-            InlineKeyboardButton("💳 Recargar Créditos", callback_data="menu_recargar"),
+        #    InlineKeyboardButton("💳 Recargar Créditos", callback_data="menu_recargar"),
         ],
         [
             InlineKeyboardButton("🎟️ Canjear Pin", callback_data="menu_canjear"),
