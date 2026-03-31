@@ -59,7 +59,7 @@ from app.services.payments import (
 from app.services.payments.payment_service import CREDITS_PER_PURCHASE
 from app.repositories.core.user_repository import UserRepository
 from app.services.voucher_service import redeem_voucher
-from config import PREDICTION_COST
+from config import PREDICTION_COST, CREDIT_PACKAGES
 
 load_dotenv()
 
@@ -263,11 +263,34 @@ async def _callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     elif data == "menu_valuebets":
         await _do_valuebets(query.message, context)
     elif data == "menu_comprar":
-        await _do_comprar_gateway_select(query, context)
-    elif data == "menu_comprar_mp":
-        await _do_comprar_checkout(query, context, Gateway.MERCADOPAGO)
-    elif data == "menu_comprar_paypal":
-        await _do_comprar_checkout(query, context, Gateway.PAYPAL)
+        await _do_comprar_package_select(query, context)
+    elif data.startswith("buy_pack_"):
+        pack_id = data.removeprefix("buy_pack_")
+        pkg = next((p for p in CREDIT_PACKAGES if p["id"] == pack_id), None)
+        if pkg:
+            pen_price = pkg["prices"].get("PEN", 0)
+            await _safe_edit_or_send(
+                query.message,
+                f"🛒 <b>{pkg['credits']} créditos</b> — S/ {pen_price:.2f}\n\n"
+                f"Elige tu método de pago:",
+                parse_mode="HTML",
+                reply_markup=_gateway_keyboard_for_pack(pack_id),
+            )
+        else:
+            await _safe_edit_or_send(query.message, "⚠️ Paquete no encontrado.")
+    elif data.startswith("buy_mp_"):
+        pack_id = data.removeprefix("buy_mp_")
+        await _do_comprar_checkout(query, context, Gateway.MERCADOPAGO, pack_id)
+    elif data.startswith("buy_pp_"):
+        pack_id = data.removeprefix("buy_pp_")
+        await _do_comprar_checkout(query, context, Gateway.PAYPAL, pack_id)
+    elif data == "menu_back":
+        await _safe_edit_or_send(
+            query.message,
+            "📋 <b>Menú principal</b>\n\nElige una opción:",
+            parse_mode="HTML",
+            reply_markup=_main_menu_keyboard(),
+        )
     elif data == "menu_saldo":
         user = query.from_user
         if user:
@@ -288,7 +311,7 @@ async def _callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             finally:
                 db.close()
     elif data == "menu_recargar":
-        await _do_comprar_gateway_select(query, context)
+        await _do_comprar_package_select(query, context)
     elif data == "menu_canjear":
         await _safe_edit_or_send(
             query.message,
@@ -991,31 +1014,54 @@ def _format_stake_analysis(
 
 # ── /comprar ──────────────────────────────────────────────────────────────
 
-def _gateway_selection_keyboard() -> InlineKeyboardMarkup:
-    """Inline keyboard with one button per available gateway."""
+def _package_selection_keyboard() -> InlineKeyboardMarkup:
+    """Inline keyboard with one button per credit package."""
+    buttons = []
+    for pkg in CREDIT_PACKAGES:
+        pen_price = pkg["prices"].get("PEN", 0)
+        buttons.append([InlineKeyboardButton(
+            f"📦 {pkg['credits']} créditos — S/ {pen_price:.2f}",
+            callback_data=f"buy_pack_{pkg['id']}",
+        )])
+    buttons.append([InlineKeyboardButton("🔙 Volver", callback_data="menu_back")])
+    return InlineKeyboardMarkup(buttons)
+
+
+def _gateway_keyboard_for_pack(pack_id: str) -> InlineKeyboardMarkup:
+    """Inline keyboard with gateway options for a specific package."""
     mp = PaymentFactory.create(Gateway.MERCADOPAGO)
     pp = PaymentFactory.create(Gateway.PAYPAL)
+    # Find package to show per-gateway price
+    pkg = next((p for p in CREDIT_PACKAGES if p["id"] == pack_id), None)
+    if pkg:
+        mp_price = pkg["prices"].get(mp.pricing.currency, 0)
+        pp_price = pkg["prices"].get(pp.pricing.currency, 0)
+        mp_label = f"S/ {mp_price:.2f}" if mp.pricing.currency == "PEN" else f"${mp_price:.2f}"
+        pp_label = f"${pp_price:.2f}" if pp.pricing.currency == "USD" else f"S/ {pp_price:.2f}"
+    else:
+        mp_label = mp.pricing.label
+        pp_label = pp.pricing.label
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(
-            f"🇵🇪 Mercado Pago — {mp.pricing.label}",
-            callback_data="menu_comprar_mp",
+            f"🇵🇪 Mercado Pago — {mp_label}",
+            callback_data=f"buy_mp_{pack_id}",
         )],
         [InlineKeyboardButton(
-            f"🌎 PayPal — {pp.pricing.label}",
-            callback_data="menu_comprar_paypal",
+            f"🌎 PayPal — {pp_label}",
+            callback_data=f"buy_pp_{pack_id}",
         )],
+        [InlineKeyboardButton("🔙 Volver", callback_data="menu_recargar")],
     ])
 
 
-async def _do_comprar_gateway_select(query, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show gateway selection buttons (inline callback)."""
+async def _do_comprar_package_select(query, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show available credit packages (inline callback)."""
     await _safe_edit_or_send(
         query.message,
-        f"🛒 <b>Comprar créditos</b>\n\n"
-        f"📦 <b>{CREDITS_PER_PURCHASE} créditos</b>\n\n"
-        f"Elige tu método de pago:",
+        "🛒 <b>Comprar créditos</b>\n\n"
+        "Elige el paquete que deseas:",
         parse_mode="HTML",
-        reply_markup=_gateway_selection_keyboard(),
+        reply_markup=_package_selection_keyboard(),
     )
 
 
@@ -1023,40 +1069,64 @@ async def _do_comprar_checkout(
     query,
     context: ContextTypes.DEFAULT_TYPE,
     gateway: Gateway,
+    pack_id: str,
 ) -> None:
-    """Generate a checkout link for the chosen gateway (inline callback)."""
+    """Generate a checkout link for the chosen gateway + package."""
     user = query.from_user
     if not user:
         return
+
+    pkg = next((p for p in CREDIT_PACKAGES if p["id"] == pack_id), None)
+    if not pkg:
+        await _safe_edit_or_send(query.message, "⚠️ Paquete no encontrado.")
+        return
+
     db = _db()
     try:
         provider = PaymentFactory.create(gateway)
+        currency = provider.pricing.currency
+        price = pkg["prices"].get(currency)
+        if price is None:
+            await _safe_edit_or_send(
+                query.message,
+                "⚠️ Precio no disponible para esta pasarela.",
+            )
+            return
+        credits = pkg["credits"]
+
         svc = PaymentService(db, provider)
-        init_point: str = await svc.create_checkout(user.id)
+        init_point: str = await svc.create_checkout(
+            user.id, credits=credits, price=price,
+        )
         if not init_point:
             await _safe_edit_or_send(
                 query.message,
                 "⚠️ No se pudo generar el link de pago.",
             )
             return
-        pricing = provider.pricing
+
+        if currency == "PEN":
+            price_label = f"S/ {price:.2f}"
+        else:
+            price_label = f"${price:.2f}"
+
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton(
-                f"💳 Pagar {pricing.label} → {CREDITS_PER_PURCHASE} créditos",
+                f"💳 Pagar {price_label} → {credits} créditos",
                 url=init_point,
             )],
         ])
         await _safe_edit_or_send(
             query.message,
             f"🛒 <b>Comprar créditos</b>\n\n"
-            f"📦 <b>{CREDITS_PER_PURCHASE} créditos</b> por "
-            f"<b>{pricing.label}</b>\n\n"
+            f"📦 <b>{credits} créditos</b> por "
+            f"<b>{price_label}</b>\n\n"
             f"Toca el botón para ir a pagar.",
             parse_mode="HTML",
             reply_markup=keyboard,
         )
     except Exception:
-        logger.exception("Error en menu_comprar_%s callback", gateway.value)
+        logger.exception("Error en checkout %s pack %s", gateway.value, pack_id)
         await _safe_edit_or_send(
             query.message,
             "⚠️ Error al conectar con la pasarela de pago.",
@@ -1066,18 +1136,17 @@ async def _do_comprar_checkout(
 
 
 async def cmd_comprar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Muestra la selección de pasarela de pago (/comprar)."""
+    """Muestra la selección de paquetes (/comprar)."""
     user = update.effective_user
     if not user:
         return
 
     await _safe_reply(
         update,
-        f"🛒 <b>Comprar créditos</b>\n\n"
-        f"📦 <b>{CREDITS_PER_PURCHASE} créditos</b>\n\n"
-        f"Elige tu método de pago:",
+        "🛒 <b>Comprar créditos</b>\n\n"
+        "Elige el paquete que deseas:",
         parse_mode="HTML",
-        reply_markup=_gateway_selection_keyboard(),
+        reply_markup=_package_selection_keyboard(),
     )
 
 

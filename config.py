@@ -45,6 +45,14 @@ CALIBRATION_MIN_SAMPLES = int(os.getenv("CALIBRATION_MIN_SAMPLES", "30"))
 # Cost in credits per prediction request.
 PREDICTION_COST = int(os.getenv("PREDICTION_COST", "10"))
 
+# ── Credit Packages ──────────────────────────────────────────────────────
+# Each entry: id, credits granted, prices per currency (PEN for MP, USD for PayPal).
+CREDIT_PACKAGES: list[dict] = [
+    {"id": "50",  "credits": 50,  "prices": {"PEN": 30.00, "USD": 8.00}},
+    {"id": "80",  "credits": 80,  "prices": {"PEN": 50.00, "USD": 13.50}},
+    {"id": "100", "credits": 100, "prices": {"PEN": 55.00, "USD": 14.99}},
+]
+
 # ── App Base URL (ngrok / dominio público) ───────────────────────────────
 # Requerido por los providers de pago para notification_url y back_urls.
 _raw_base_url = os.getenv("APP_BASE_URL", "").rstrip("/")

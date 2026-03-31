@@ -15,12 +15,14 @@ from app.services.payments.base import (
     PaymentProvider,
     PaymentResult,
 )
+from config import CREDIT_PACKAGES
 
 logger = logging.getLogger(__name__)
 
+# Legacy fallback — only used when external_reference has no ":credits" suffix.
 CREDITS_PER_PURCHASE: int = int(os.getenv("MP_CREDITS_PER_PURCHASE", "50"))
-ITEM_PRICE: float = float(os.getenv("MP_ITEM_PRICE", "50.00"))
-ITEM_CURRENCY: str = os.getenv("MP_ITEM_CURRENCY", "PEN")
+
+_VALID_CREDITS: set[int] = {p["credits"] for p in CREDIT_PACKAGES}
 
 
 class PaymentService:
@@ -40,31 +42,46 @@ class PaymentService:
     def pricing(self) -> GatewayPricing:
         return self._provider.pricing
 
-    async def create_checkout(self, telegram_id: int) -> str:
-        """Build a checkout preference and return the payment URL."""
+    async def create_checkout(
+        self,
+        telegram_id: int,
+        *,
+        credits: int,
+        price: float,
+    ) -> str:
+        """Build a checkout preference and return the payment URL.
+
+        ``credits`` and ``price`` come from the selected package in
+        ``CREDIT_PACKAGES``.
+        """
         self._user_repo.get_or_create(telegram_id=telegram_id)
 
-        gw_pricing: GatewayPricing = self._provider.pricing
+        currency: str = self._provider.pricing.currency
 
         items: list[PaymentItem] = [
             PaymentItem(
-                title=f"FútbolQuant — {CREDITS_PER_PURCHASE} créditos",
+                title=f"FútbolQuant — {credits} créditos",
                 quantity=1,
-                unit_price=gw_pricing.price,
-                currency_id=gw_pricing.currency,
+                unit_price=price,
+                currency_id=currency,
             ),
         ]
 
+        # Encode credits in external_reference so the webhook knows
+        # how many credits to grant:  "<telegram_id>:<credits>"
+        ext_ref: str = f"{telegram_id}:{credits}"
+
         init_point: str = await self._provider.create_preference(
             items=items,
-            external_reference=str(telegram_id),
+            external_reference=ext_ref,
         )
         logger.info(
-            "Checkout created for tg_id=%d via %s (%s %s)",
+            "Checkout created for tg_id=%d via %s (%s %s, %d créditos)",
             telegram_id,
             type(self._provider).__name__,
-            gw_pricing.price,
-            gw_pricing.currency,
+            price,
+            currency,
+            credits,
         )
         return init_point
 
@@ -111,10 +128,22 @@ class PaymentService:
             raise PaymentNotApproved(payment_id, result.status)
 
         external_ref: str = result.external_reference
-        if not external_ref.isdigit():
+
+        # Parse "<telegram_id>:<credits>" (legacy refs without ":" still work).
+        parts = external_ref.split(":", 1)
+        if not parts[0].isdigit():
             raise ValueError(f"Invalid external_reference: {external_ref!r}")
 
-        telegram_id: int = int(external_ref)
+        telegram_id: int = int(parts[0])
+
+        if len(parts) == 2 and parts[1].isdigit():
+            credits_to_grant: int = int(parts[1])
+            if credits_to_grant not in _VALID_CREDITS:
+                raise ValueError(
+                    f"Credits value {credits_to_grant} not in valid packages"
+                )
+        else:
+            credits_to_grant = CREDITS_PER_PURCHASE
 
         # ── 3. Ensure user exists ────────────────────────────────
         self._user_repo.get_or_create(telegram_id=telegram_id)
@@ -133,7 +162,7 @@ class PaymentService:
 
         # ── 6. Accredit credits (row is locked) ─────────────────
         new_balance: int = self._user_repo.add_creditos(
-            telegram_id, CREDITS_PER_PURCHASE,
+            telegram_id, credits_to_grant,
         )
 
         # ── 7. Record payment (UNIQUE constraint = final guard) ──
@@ -142,7 +171,7 @@ class PaymentService:
                 mp_payment_id=payment_id,
                 telegram_id=telegram_id,
                 amount=result.amount,
-                credits_granted=CREDITS_PER_PURCHASE,
+                credits_granted=credits_to_grant,
                 status=result.status,
             )
         except IntegrityError:
@@ -157,7 +186,7 @@ class PaymentService:
             "Payment %s → tg_id=%d +%d créditos (balance=%d) via %s",
             payment_id,
             telegram_id,
-            CREDITS_PER_PURCHASE,
+            credits_to_grant,
             new_balance,
             type(self._provider).__name__,
         )
