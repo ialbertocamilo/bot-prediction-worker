@@ -41,6 +41,10 @@ CALIBRATION_ENABLED = os.getenv("CALIBRATION_ENABLED", "true").lower() in ("true
 # Lowered to 30 to allow early-season calibration (Jornada 10-12).
 CALIBRATION_MIN_SAMPLES = int(os.getenv("CALIBRATION_MIN_SAMPLES", "30"))
 
+# ── Credits ──────────────────────────────────────────────────────────────
+# Cost in credits per prediction request.
+PREDICTION_COST = int(os.getenv("PREDICTION_COST", "10"))
+
 # ── App Base URL (ngrok / dominio público) ───────────────────────────────
 # Requerido por los providers de pago para notification_url y back_urls.
 _raw_base_url = os.getenv("APP_BASE_URL", "").rstrip("/")

@@ -59,6 +59,7 @@ from app.services.payments import (
 from app.services.payments.payment_service import CREDITS_PER_PURCHASE
 from app.repositories.core.user_repository import UserRepository
 from app.services.voucher_service import redeem_voucher
+from config import PREDICTION_COST
 
 load_dotenv()
 
@@ -175,15 +176,19 @@ async def _safe_send(bot, chat_id: int | str, text: str, **kwargs) -> None:
 # ── Inline keyboard helpers ───────────────────────────────────────────────
 
 def _main_menu_keyboard() -> InlineKeyboardMarkup:
-    """Return the persistent main-menu inline keyboard."""
+    """Return the main-menu inline keyboard attached to messages."""
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("🏆 Ligas", callback_data="menu_leagues"),
             InlineKeyboardButton("📅 Partidos de hoy", callback_data="menu_matches"),
         ],
         [
-            InlineKeyboardButton("💳 Comprar créditos", callback_data="menu_comprar"),
-            InlineKeyboardButton("❓ Ayuda", callback_data="menu_help"),
+            InlineKeyboardButton("💰 Mi Saldo", callback_data="menu_saldo"),
+            InlineKeyboardButton("💳 Recargar Créditos", callback_data="menu_recargar"),
+        ],
+        [
+            InlineKeyboardButton("🎟️ Canjear Pin", callback_data="menu_canjear"),
+            InlineKeyboardButton("🆘 Ayuda", callback_data="menu_ayuda"),
         ],
     ])
 
@@ -195,7 +200,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     name = _esc(user.first_name or "Usuario")
     msg = (
         f"👋 <b>¡Hola {name}!</b>\n\n"
-        "Soy <b>FútbolQuant</b> — tu asistente de predicciones de fútbol "
+        "Soy <b>TurboPredictions</b> — tu asistente de predicciones de fútbol "
         "basado en el modelo estadístico <b>Dixon-Coles</b>.\n\n"
         "🧠 <b>¿Cómo funciono?</b>\n"
         "Analizo miles de partidos históricos para calcular "
@@ -263,6 +268,47 @@ async def _callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await _do_comprar_checkout(query, context, Gateway.MERCADOPAGO)
     elif data == "menu_comprar_paypal":
         await _do_comprar_checkout(query, context, Gateway.PAYPAL)
+    elif data == "menu_saldo":
+        user = query.from_user
+        if user:
+            db = _db()
+            try:
+                repo = UserRepository(db)
+                balance: int = repo.get_creditos(user.id)
+                await _safe_edit_or_send(
+                    query.message,
+                    f"💰 <b>Tus créditos:</b> {balance}\n\n"
+                    f"Usa /comprar para adquirir más.",
+                    parse_mode="HTML",
+                    reply_markup=_main_menu_keyboard(),
+                )
+            except Exception:
+                logger.exception("Error en menu_saldo para user %s", user.id)
+                await _safe_edit_or_send(query.message, "⚠️ Error al consultar créditos.")
+            finally:
+                db.close()
+    elif data == "menu_recargar":
+        await _do_comprar_gateway_select(query, context)
+    elif data == "menu_canjear":
+        await _safe_edit_or_send(
+            query.message,
+            "🎟️ Para canjear un pin, escribe el comando "
+            "/canjear seguido de tu código.\n\n"
+            "<b>Ejemplo:</b> <code>/canjear FQ-A1B2-C3D4-E5F6</code>",
+            parse_mode="HTML",
+            reply_markup=_main_menu_keyboard(),
+        )
+    elif data == "menu_ayuda":
+        await _safe_edit_or_send(
+            query.message,
+            "📖 <b>Guía Rápida</b>\n\n"
+            "<b>Flujo:</b> /leagues → /matches &lt;num&gt; → /predict &lt;num&gt;\n\n"
+            "📈 <b>Edge</b> = ventaja sobre el mercado\n"
+            "💰 <b>Stake</b> = % del bankroll (Kelly fraccionado)\n"
+            "🟢 Alta confianza · 🟡 Media · 🟠 Baja · 🔴 Muy baja",
+            parse_mode="HTML",
+            reply_markup=_main_menu_keyboard(),
+        )
     elif data == "menu_help":
         msg = (
             "📖 <b>Guía Rápida</b>\n\n"
@@ -647,7 +693,7 @@ async def cmd_predict(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             user_repo.get_or_create(telegram_id=telegram_id, username=user.username)
             user_row = user_repo.get_for_update(telegram_id)
 
-        if user_row is None or user_row.creditos <= 0:
+        if user_row is None or user_row.creditos < PREDICTION_COST:
             db.rollback()
             buy_link: str = ""
             try:
@@ -660,8 +706,10 @@ async def cmd_predict(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             link_text: str = buy_link if buy_link else "/comprar"
             await _safe_reply(
                 update,
-                "⚠️ Saldo insuficiente para ejecutar la predicción. "
+                f"⚠️ Saldo insuficiente. Necesitas <b>{PREDICTION_COST}</b> créditos "
+                f"(tienes <b>{user_row.creditos if user_row else 0}</b>).\n"
                 f"Compra más créditos aquí: {link_text}",
+                parse_mode="HTML",
             )
             return
 
@@ -692,9 +740,9 @@ async def cmd_predict(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
             return
 
-        # ── 3. Predicción exitosa → descontar 1 crédito y commit ─────
+        # ── 3. Predicción exitosa → descontar créditos y commit ────
         try:
-            new_balance: int = user_repo.deduct_credito(telegram_id)
+            new_balance: int = user_repo.deduct_credito(telegram_id, amount=PREDICTION_COST)
             db.commit()
         except Exception:
             logger.exception("DB error deducting credit for tg_id=%d", telegram_id)
@@ -707,8 +755,8 @@ async def cmd_predict(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
 
         logger.info(
-            "/predict tg_id=%d match=%d → -1 crédito (balance=%d)",
-            telegram_id, match_id, new_balance,
+            "/predict tg_id=%d match=%d → -%d créditos (balance=%d)",
+            telegram_id, match_id, PREDICTION_COST, new_balance,
         )
 
         # ── 4. Enviar resultado al usuario ────────────────────────────
