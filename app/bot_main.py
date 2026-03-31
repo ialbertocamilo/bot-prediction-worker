@@ -1455,7 +1455,7 @@ def main() -> None:
     app.add_handler(CommandHandler("matches", cmd_matches))
     app.add_handler(CommandHandler("predict", cmd_predict))
     app.add_handler(CommandHandler("valuebets", cmd_valuebets))
-    app.add_handler(CommandHandler("comprar", cmd_comprar))
+    # app.add_handler(CommandHandler("comprar", cmd_comprar))
     app.add_handler(CommandHandler("creditos", cmd_creditos))
     app.add_handler(CommandHandler("canjear", cmd_canjear))
 
