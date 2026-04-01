@@ -382,6 +382,17 @@ async def cmd_leagues(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await _do_leagues(update.message, context)
 
 
+# Mapping of international league keys → short emoji labels for buttons
+_INTL_KEYS: dict[str, str] = {
+    "world-cup": "🏆 Mundial 2026",
+    "wcq-conmebol": "🌎 Elim. CONMEBOL",
+    "wcq-uefa": "🇪🇺 Elim. UEFA",
+    "copa-america": "🌎 Copa América",
+    "euro": "🇪🇺 Eurocopa",
+    "intl-friendly": "🤝 Amistosos Int.",
+}
+
+
 async def _do_leagues(message, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Shared logic for /leagues command and inline button."""
     db = _db()
@@ -393,11 +404,15 @@ async def _do_leagues(message, context: ContextTypes.DEFAULT_TYPE) -> None:
             await _safe_edit_or_send(message, "⚠️ No hay ligas registradas en la DB.")
             return
 
-        lines = ["🏆 <b>Ligas disponibles</b>\n"]
+        # Separate club leagues from international competitions
+        club_leagues = [lg for lg in leagues if lg.key not in _INTL_KEYS]
+        intl_leagues = [lg for lg in leagues if lg.key in _INTL_KEYS]
+
+        lines = ["⚽ <b>Ligas de Clubes</b>\n"]
         keyboard_rows: list[list[InlineKeyboardButton]] = []
         row: list[InlineKeyboardButton] = []
 
-        for lg in leagues:
+        for lg in club_leagues:
             country = f" ({_esc(lg.country)})" if lg.country else ""
             status = "✅" if lg.scheduled_matches > 0 else "⏸️"
             lines.append(
@@ -405,7 +420,6 @@ async def _do_leagues(message, context: ContextTypes.DEFAULT_TYPE) -> None:
                 f"       {lg.finished_matches} jugados · {lg.scheduled_matches} programados"
             )
 
-            # Build inline keyboard: 2 buttons per row
             btn = InlineKeyboardButton(
                 f"{lg.index}. {lg.display_name[:18]}",
                 callback_data=f"league_{lg.index}",
@@ -417,6 +431,31 @@ async def _do_leagues(message, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         if row:
             keyboard_rows.append(row)
+            row = []
+
+        # ── Selecciones Nacionales section ────────────────────────────
+        if intl_leagues:
+            lines.append("\n🌍 <b>Selecciones Nacionales</b>\n")
+            for lg in intl_leagues:
+                status = "✅" if lg.scheduled_matches > 0 else "⏸️"
+                lines.append(
+                    f"  {status} <b>{lg.index}</b> — {_esc(lg.display_name)}\n"
+                    f"       {lg.finished_matches} jugados · {lg.scheduled_matches} programados"
+                )
+
+            # Buttons: 2 per row with emoji labels
+            for lg in intl_leagues:
+                label = _INTL_KEYS.get(lg.key, lg.display_name[:18])
+                btn = InlineKeyboardButton(
+                    label,
+                    callback_data=f"league_{lg.index}",
+                )
+                row.append(btn)
+                if len(row) == 2:
+                    keyboard_rows.append(row)
+                    row = []
+            if row:
+                keyboard_rows.append(row)
 
         lines.append("\n<i>Toca una liga o usa /matches &lt;num&gt;</i>")
         markup = InlineKeyboardMarkup(keyboard_rows) if keyboard_rows else None
