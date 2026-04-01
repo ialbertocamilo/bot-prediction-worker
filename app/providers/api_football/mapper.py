@@ -60,11 +60,23 @@ class ApiFootballMapper:
             fixture["date"].replace("Z", "+00:00")
         )
 
+        mapped_status = ApiFootballMapper._map_status(fixture_status.get("short"))
+
+        # Clock display para partidos en vivo (e.g. "45'" o "HT")
+        clock_display: str | None = None
+        if mapped_status == MatchStatus.in_play:
+            elapsed = fixture_status.get("elapsed")
+            short = fixture_status.get("short", "")
+            if short == "HT":
+                clock_display = "HT"
+            elif elapsed is not None:
+                clock_display = f"{elapsed}'"
+
         return CanonicalMatch(
             league_name=league.get("name"),
             season_year=league.get("season"),
             utc_date=utc_date,
-            status=ApiFootballMapper._map_status(fixture_status.get("short")),
+            status=mapped_status,
             home_team_name=teams["home"]["name"],
             away_team_name=teams["away"]["name"],
             home_team_external_id=str(teams["home"]["id"]),
@@ -77,6 +89,7 @@ class ApiFootballMapper:
             ht_away_goals=halftime.get("away"),
             round=league.get("round"),
             referee=fixture.get("referee"),
+            clock_display=clock_display,
             source_ref=CanonicalSourceRef(
                 source_name="api-football",
                 entity_type="match",

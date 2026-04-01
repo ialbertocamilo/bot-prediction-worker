@@ -35,24 +35,28 @@ def _parse_calendar_dates(
     date_from: date,
     date_to: date,
 ) -> list[date]:
-    """Extract target dates from ESPN calendar entries within [date_from, date_to]."""
+    """Extract target dates from ESPN calendar entries within [date_from, date_to].
+
+    ESPN uses two calendar formats:
+    - **Domestic leagues**: flat list of date strings (one per matchday).
+    - **Tournaments** (WCQ, Copa, Euro): nested dicts with ``entries``
+      containing phase ranges (Group, Playoffs, etc.) — individual match
+      dates are NOT listed.
+
+    When the tournament format is detected we return ``[]`` so the caller
+    falls back to scanning every date in the range.
+    """
     target_dates: list[date] = []
     for cal_entry in calendar_entries:
         try:
             if isinstance(cal_entry, str):
                 raw = cal_entry[:10]
             elif isinstance(cal_entry, dict):
+                # Tournament / phase format → can't derive individual dates
+                if cal_entry.get("entries"):
+                    return []
                 raw = cal_entry.get("startDate", cal_entry.get("date", ""))[:10]
                 if not raw:
-                    for e in cal_entry.get("entries", []):
-                        sd = e.get("startDate", "")[:10]
-                        if sd:
-                            try:
-                                cd = date.fromisoformat(sd)
-                                if date_from <= cd <= date_to and cd not in target_dates:
-                                    target_dates.append(cd)
-                            except (ValueError, IndexError):
-                                pass
                     continue
             else:
                 continue

@@ -72,6 +72,8 @@ class CanonicalMatch(CanonicalBase):
     round: str | None = None
     referee: str | None = None
 
+    clock_display: str | None = None
+
     source_ref: CanonicalSourceRef | None = None
 
 

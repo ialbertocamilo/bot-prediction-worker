@@ -14,6 +14,10 @@ from app.domain.enums import EventType, MatchStatus
 
 SOURCE_NAME = "espn-scraper"
 
+# Plantilla de logo para equipos de club.  Para selecciones nacionales ESPN
+# envía directamente la URL del logo del país en el campo "logo" del equipo
+# (ej. teamlogos/countries/500/per.png), por lo que esta plantilla sólo actúa
+# como fallback para clubes cuyo campo "logo" venga vacío.
 _ESPN_LOGO_TPL = "https://a.espncdn.com/i/teamlogos/soccer/500/{}.png"
 
 
@@ -62,10 +66,10 @@ class EspnScraperMapper:
         status_data: dict[str, Any] = comp.get("status", {})
         status: MatchStatus = EspnScraperMapper._map_status(status_data)
 
-        # Goles: el campo "score" es un string en ESPN
+        # Goles: extraer para partidos en juego y terminados
         home_goals: int | None = None
         away_goals: int | None = None
-        if status == MatchStatus.finished:
+        if status in (MatchStatus.in_play, MatchStatus.finished):
             try:
                 home_goals = int(home.get("score", "0"))
             except (ValueError, TypeError):
@@ -74,6 +78,14 @@ class EspnScraperMapper:
                 away_goals = int(away.get("score", "0"))
             except (ValueError, TypeError):
                 pass
+
+        # Clock display para partidos en vivo (e.g. "35'" o "HT")
+        clock_display: str | None = None
+        if status == MatchStatus.in_play:
+            clock_display = (
+                status_data.get("displayClock")
+                or status_data.get("type", {}).get("shortDetail")
+            )
 
         # Fecha UTC
         utc_date = datetime.fromisoformat(
@@ -115,6 +127,7 @@ class EspnScraperMapper:
             ht_away_goals=None,
             round=None,
             referee=None,
+            clock_display=clock_display,
             source_ref=CanonicalSourceRef(
                 source_name=SOURCE_NAME,
                 entity_type="match",

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from difflib import SequenceMatcher
+
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
@@ -50,7 +52,7 @@ class TeamRepository:
         if by_short is not None:
             return by_short
 
-        # 3) SQL ilike — substring search on name and short_name
+        # 3) SQL ilike — substring candidates, filtered by similarity
         pattern = f"%{name}%"
         stmt = select(Team).where(
             or_(
@@ -62,8 +64,17 @@ class TeamRepository:
             stmt = stmt.where(Team.country == country)
         stmt = stmt.limit(10)
 
-        match = self.db.scalar(stmt)
-        return match
+        name_lower = name.lower().strip()
+        best: Team | None = None
+        best_ratio: float = 0.0
+        for candidate in self.db.scalars(stmt):
+            ratio = SequenceMatcher(
+                None, name_lower, candidate.name.lower().strip(),
+            ).ratio()
+            if ratio >= threshold and ratio > best_ratio:
+                best = candidate
+                best_ratio = ratio
+        return best
 
     def create(
         self,

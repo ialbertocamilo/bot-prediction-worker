@@ -233,6 +233,84 @@ LEAGUE_GROUPS: list[_LeagueGroup] = [
         provider_name="espn-scraper",
         strength_coefficient=0.70,
     ),
+    # ── Selecciones Nacionales / International ─────────────────────────────
+    _LeagueGroup(
+        key="world-cup",
+        display_name="Copa del Mundo 2026",
+        country=None,
+        db_league_ids=[],
+        league_names=["FIFA World Cup", "World Cup"],
+        provider_slug="fifa.world",
+        provider_name="espn-scraper",
+        strength_coefficient=1.20,
+    ),
+    _LeagueGroup(
+        key="wcq-conmebol",
+        display_name="Eliminatorias CONMEBOL",
+        country=None,
+        db_league_ids=[],
+        league_names=[
+            "FIFA World Cup Qualifying - CONMEBOL",
+            "WCQ - CONMEBOL",
+            "Eliminatorias Sudamericanas",
+        ],
+        provider_slug="fifa.worldq.conmebol",
+        provider_name="espn-scraper",
+        strength_coefficient=1.05,
+    ),
+    _LeagueGroup(
+        key="wcq-uefa",
+        display_name="Eliminatorias UEFA",
+        country=None,
+        db_league_ids=[],
+        league_names=[
+            "FIFA World Cup Qualifying - UEFA",
+            "WCQ - UEFA",
+            "European Qualifiers",
+        ],
+        provider_slug="fifa.worldq.uefa",
+        provider_name="espn-scraper",
+        strength_coefficient=1.05,
+    ),
+    _LeagueGroup(
+        key="copa-america",
+        display_name="Copa América",
+        country=None,
+        db_league_ids=[],
+        league_names=["Copa América", "Copa America", "CONMEBOL Copa America"],
+        provider_slug="conmebol.america",
+        provider_name="espn-scraper",
+        strength_coefficient=1.15,
+    ),
+    _LeagueGroup(
+        key="euro",
+        display_name="Eurocopa",
+        country=None,
+        db_league_ids=[],
+        league_names=[
+            "UEFA European Championship",
+            "Euro",
+            "UEFA Euro",
+            "European Championship",
+        ],
+        provider_slug="uefa.euro",
+        provider_name="espn-scraper",
+        strength_coefficient=1.15,
+    ),
+    _LeagueGroup(
+        key="intl-friendly",
+        display_name="Amistosos Internacionales",
+        country=None,
+        db_league_ids=[],
+        league_names=[
+            "International Friendly",
+            "Men's International Friendly",
+            "Friendlies",
+        ],
+        provider_slug="fifa.friendly",
+        provider_name="espn-scraper",
+        strength_coefficient=0.60,
+    ),
 ]
 
 
@@ -330,17 +408,15 @@ class CanonicalLeagueService:
 
     @staticmethod
     def _name_matches(db_name: str, patterns: list[str]) -> bool:
-        """Case-insensitive match: exact OR pattern is a substring of db_name.
+        """Case-insensitive **exact** match only.
 
-        NOTE: only checks `p_lower in db_lower`, NOT the reverse.
-        The reverse (`db_lower in p_lower`) caused cross-league contamination
-        — e.g. DB name 'Primera División' matched Chile's pattern
-        'Chilean Primera División' when it should only match Peru.
+        Plain substring is intentionally avoided to prevent cross-league
+        contamination (e.g. 'FIFA World Cup' inside 'FIFA World Cup
+        Qualifying - CONMEBOL', or 'Euro' inside 'UEFA Europa League').
         """
         db_lower = db_name.lower().strip()
         for p in patterns:
-            p_lower = p.lower().strip()
-            if db_lower == p_lower or p_lower in db_lower:
+            if db_lower == p.lower().strip():
                 return True
         return False
 
@@ -422,6 +498,57 @@ class CanonicalLeagueService:
         upcoming = self._dedup(upcoming)
         upcoming.sort(key=lambda m: m.utc_date or datetime.min.replace(tzinfo=timezone.utc))
         return upcoming
+
+    def get_todays_matches(
+        self,
+        canonical_index: int | None = None,
+        days_ahead: int = UPCOMING_DAYS_WINDOW,
+    ) -> list[Match]:
+        """Devuelve partidos de hoy (EN VIVO + TERMINADOS) + próximos SCHEDULED.
+
+        Orden: EN VIVO primero, luego PROGRAMADOS (hoy+futuro), luego TERMINADOS hoy.
+        """
+        now = datetime.now(timezone.utc)
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        date_to = now + timedelta(days=days_ahead)
+        repo = MatchRepository(self.db)
+
+        # Fetch all matches from today's start through days_ahead
+        if canonical_index is not None:
+            league_ids = self._ids_for_index(canonical_index)
+            if not league_ids:
+                return []
+            all_m: list[Match] = []
+            for lid in league_ids:
+                all_m.extend(
+                    repo.list_by_date_range(
+                        date_from=today_start, date_to=date_to, league_id=lid,
+                    )
+                )
+        else:
+            all_m = repo.list_by_date_range(date_from=today_start, date_to=date_to)
+
+        all_m = self._dedup(all_m)
+
+        _min_dt = datetime.min.replace(tzinfo=timezone.utc)
+
+        live = [m for m in all_m if m.status == "IN_PLAY"]
+        live.sort(key=lambda m: m.utc_date or _min_dt)
+
+        scheduled = [m for m in all_m if m.status in ("SCHEDULED", "NS")]
+        scheduled.sort(key=lambda m: m.utc_date or _min_dt)
+
+        # Only today's finished (not future dates obviously)
+        tomorrow_start = today_start + timedelta(days=1)
+        finished = [
+            m for m in all_m
+            if m.status == "FINISHED"
+            and m.utc_date
+            and m.utc_date < tomorrow_start
+        ]
+        finished.sort(key=lambda m: m.utc_date or _min_dt, reverse=True)
+
+        return live + scheduled + finished
 
     # ── nombre canónico para un league_id de la DB ────────────────────────
 

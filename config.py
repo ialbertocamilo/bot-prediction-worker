@@ -63,3 +63,6 @@ if not _raw_base_url:
         "Ejemplo: APP_BASE_URL=https://tu-subdominio.ngrok-free.dev"
     )
 APP_BASE_URL: str = _raw_base_url
+
+# ── Gemini AI ─────────────────────────────────────────────────────────────
+GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")

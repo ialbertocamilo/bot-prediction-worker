@@ -59,7 +59,7 @@ from app.services.payments import (
 from app.services.payments.payment_service import CREDITS_PER_PURCHASE
 from app.repositories.core.user_repository import UserRepository
 from app.services.voucher_service import redeem_voucher
-from config import PREDICTION_COST, CREDIT_PACKAGES
+from config import PREDICTION_COST, CREDIT_PACKAGES, GEMINI_API_KEY
 
 load_dotenv()
 
@@ -455,8 +455,8 @@ def _render_matches(
     svc: CanonicalLeagueService,
     filter_label: str = "",
 ) -> str:
-    """Build the HTML text for a list of upcoming matches."""
-    lines = [f"⚽ <b>Próximos partidos{_esc(filter_label)}</b>\n"]
+    """Build the HTML text for a list of matches (live + scheduled + finished today)."""
+    lines = [f"⚽ <b>Partidos{_esc(filter_label)}</b>\n"]
     current_league = ""
 
     for idx, m in enumerate(upcoming[:30], 1):
@@ -467,16 +467,34 @@ def _render_matches(
 
         home = _esc(m.home_team.name if m.home_team else "?")
         away = _esc(m.away_team.name if m.away_team else "?")
-        date_str = m.utc_date.strftime("%d/%m %H:%M") if m.utc_date else "?"
         rnd = f" (J{_esc(m.round)})" if m.round else ""
 
-        lines.append(
-            f"  <b>{idx}.</b> {home} vs {away}\n"
-            f"      🕐 {date_str} UTC{rnd}"
-        )
+        if m.status == "IN_PLAY":
+            clock = _esc(m.clock_display) if m.clock_display else "En vivo"
+            hg = m.home_goals if m.home_goals is not None else 0
+            ag = m.away_goals if m.away_goals is not None else 0
+            lines.append(
+                f"  <b>{idx}.</b> 🔴 <b>EN VIVO</b> ({clock})"
+                f" [ID: {m.id}]\n"
+                f"      {home} <b>{hg}</b> - <b>{ag}</b> {away}{rnd}"
+            )
+        elif m.status == "FINISHED":
+            hg = m.home_goals if m.home_goals is not None else "?"
+            ag = m.away_goals if m.away_goals is not None else "?"
+            lines.append(
+                f"  <b>{idx}.</b> ✅ <b>TERMINADO</b>\n"
+                f"      {home} <b>{hg}</b> - <b>{ag}</b> {away}{rnd}"
+            )
+        else:
+            date_str = m.utc_date.strftime("%d/%m %H:%M") if m.utc_date else "?"
+            lines.append(
+                f"  <b>{idx}.</b> ⏳ {date_str} UTC\n"
+                f"      {home} vs {away}{rnd}"
+            )
 
     lines.append(
         "\n<i>Usa /predict &lt;num&gt; para ver la predicción.\n"
+        "🔴 En vivo: /analizar &lt;ID&gt; para análisis IA.\n"
         "Ejemplo: /predict 1</i>"
     )
     text = "\n".join(lines)
@@ -501,7 +519,7 @@ async def _background_ui_updater(
         db = SessionLocal()
         try:
             svc = CanonicalLeagueService(db)
-            upcoming = svc.get_upcoming(canonical_index)
+            upcoming = svc.get_todays_matches(canonical_index)
 
             if upcoming:
                 _cache_set(chat_id, upcoming)
@@ -582,7 +600,7 @@ async def _do_matches(
                 return
 
         # ── Fast DB read (microseconds on PostgreSQL) ─────────────────
-        upcoming = svc.get_upcoming(canonical_index)
+        upcoming = svc.get_todays_matches(canonical_index)
         last_ingest = (
             svc.get_last_ingest_at(canonical_index)
             if canonical_index is not None
@@ -1438,6 +1456,78 @@ async def _scheduled_hydration(context: ContextTypes.DEFAULT_TYPE) -> None:
     asyncio.create_task(_hydrate_all_leagues(), name="scheduled-hydration")
 
 
+# ── /analizar ─────────────────────────────────────────────────────────────
+
+async def cmd_analizar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Análisis IA en vivo de un partido usando Gemini 1.5 Flash."""
+    if not context.args:
+        await _safe_reply(
+            update,
+            "ℹ️ Uso: /analizar &lt;ID&gt;\n\n"
+            "Usa /matches para ver los partidos en vivo con su ID.",
+            parse_mode="HTML",
+        )
+        return
+
+    try:
+        match_id = int(context.args[0])
+    except ValueError:
+        await _safe_reply(update, "⚠️ El ID debe ser un número. Ejemplo: /analizar 8472")
+        return
+
+    db = _db()
+    try:
+        from app.repositories.football.match_repository import MatchRepository
+        repo = MatchRepository(db)
+        match = repo.get_by_id(match_id)
+
+        if match is None:
+            await _safe_reply(update, "❌ No se encontró ningún partido con ese ID.")
+            return
+
+        if match.status != "IN_PLAY" or not match.clock_display:
+            await _safe_reply(
+                update,
+                "❌ Solo puedo analizar partidos que se están jugando en este momento.",
+            )
+            return
+
+        # Send loading message, then edit with result
+        loading_msg = await update.message.reply_text("⏳ Analizando el partido con IA...")
+
+        from app.services.ai_service import analyze_live_match
+
+        if not GEMINI_API_KEY:
+            await loading_msg.edit_text("⚠️ GEMINI_API_KEY no configurada. Contacta al administrador.")
+            return
+
+        analysis = await analyze_live_match(match, api_key=GEMINI_API_KEY)
+
+        home = _esc(match.home_team.name if match.home_team else "?")
+        away = _esc(match.away_team.name if match.away_team else "?")
+        hg = match.home_goals if match.home_goals is not None else 0
+        ag = match.away_goals if match.away_goals is not None else 0
+        clock = _esc(match.clock_display)
+
+        header = (
+            f"🔴 <b>Análisis EN VIVO</b> ({clock})\n"
+            f"⚽ {home} <b>{hg}</b> - <b>{ag}</b> {away}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+        )
+
+        text = header + _esc(analysis)
+        if len(text) > 4000:
+            text = text[:3950] + "\n..."
+
+        await loading_msg.edit_text(text, parse_mode="HTML")
+
+    except Exception:
+        logger.exception("Error en /analizar (match_id=%s)", context.args[0])
+        await _safe_reply(update, "⚠️ Error al generar el análisis. Intenta de nuevo.")
+    finally:
+        db.close()
+
+
 # ── main ──────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -1458,6 +1548,7 @@ def main() -> None:
     # app.add_handler(CommandHandler("comprar", cmd_comprar))
     app.add_handler(CommandHandler("creditos", cmd_creditos))
     app.add_handler(CommandHandler("canjear", cmd_canjear))
+    app.add_handler(CommandHandler("analizar", cmd_analizar))
 
     # Inline button handler (main menu + league selection)
     app.add_handler(CallbackQueryHandler(_callback_handler))

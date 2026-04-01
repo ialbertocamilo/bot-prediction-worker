@@ -154,6 +154,7 @@ class MatchIngestService:
                 ht_away_goals=canonical_match.ht_away_goals,
                 round_value=canonical_match.round,
                 referee=canonical_match.referee,
+                clock_display=canonical_match.clock_display,
             )
             return updated_match.id
 
@@ -177,6 +178,7 @@ class MatchIngestService:
                 ht_away_goals=canonical_match.ht_away_goals,
                 round_value=canonical_match.round,
                 referee=canonical_match.referee,
+                clock_display=canonical_match.clock_display,
             )
 
             self.external_id_repo.get_or_create_mapping(
@@ -201,6 +203,7 @@ class MatchIngestService:
             ht_away_goals=canonical_match.ht_away_goals,
             round_value=canonical_match.round,
             referee=canonical_match.referee,
+            clock_display=canonical_match.clock_display,
         )
 
         self.external_id_repo.create_mapping(

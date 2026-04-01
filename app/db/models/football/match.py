@@ -45,6 +45,8 @@ class Match(Base):
     round: Mapped[str | None] = mapped_column(String(80), nullable=True)
     referee: Mapped[str | None] = mapped_column(String(120), nullable=True)
 
+    clock_display: Mapped[str | None] = mapped_column(String(20), nullable=True)
+
     is_finished: Mapped[bool] = mapped_column(
         Boolean, nullable=False, server_default="false"
     )

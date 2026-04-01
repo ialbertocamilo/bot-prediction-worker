@@ -7,6 +7,8 @@ from sqlalchemy.orm import Session
 
 from app.db.models.football.match import Match
 
+_SENTINEL = object()  # distinguish "not passed" from None
+
 
 class MatchRepository:
     def __init__(self, db: Session) -> None:
@@ -46,6 +48,7 @@ class MatchRepository:
         ht_away_goals: int | None = None,
         round_value: str | None = None,
         referee: str | None = None,
+        clock_display: str | None = None,
     ) -> Match:
         match: Match = Match(
             league_id=league_id,
@@ -62,6 +65,7 @@ class MatchRepository:
             ht_away_goals=ht_away_goals,
             round=round_value,
             referee=referee,
+            clock_display=clock_display,
         )
         self.db.add(match)
         self.db.flush()
@@ -82,6 +86,7 @@ class MatchRepository:
         ht_away_goals: int | None = None,
         round_value: str | None = None,
         referee: str | None = None,
+        clock_display: str | None = _SENTINEL,
     ) -> Match:
         if status is not None:
             match.status = status
@@ -108,6 +113,9 @@ class MatchRepository:
         if referee is not None:
             match.referee = referee
 
+        if clock_display is not _SENTINEL:
+            match.clock_display = clock_display
+
         self.db.flush()
         self.db.refresh(match)
         return match
@@ -127,6 +135,7 @@ class MatchRepository:
         ht_away_goals: int | None = None,
         round_value: str | None = None,
         referee: str | None = None,
+        clock_display: str | None = None,
     ) -> Match:
         match: Match | None = self.find_by_signature(
             league_id=league_id,
@@ -151,6 +160,7 @@ class MatchRepository:
             ht_away_goals=ht_away_goals,
             round_value=round_value,
             referee=referee,
+            clock_display=clock_display,
         )
 
     def list_upcoming_by_league(
