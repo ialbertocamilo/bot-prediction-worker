@@ -227,7 +227,7 @@ LEAGUE_GROUPS: list[_LeagueGroup] = [
         key="primera-division-chile",
         display_name="Primera División Chile",
         country="Chile",
-        db_league_ids=[26],
+        db_league_ids=[26, 33, 34],
         league_names=["Chilean Primera División"],
         provider_slug="chi.1",
         provider_name="espn-scraper",
@@ -763,11 +763,20 @@ class CanonicalLeagueService:
         if not ids:
             return
 
-        # Update league country if NULL
+        # Update league country if NULL — only for leagues that are
+        # statically listed in db_league_ids OR whose name exactly matches
+        # THIS group's league_names (not inherited from another group).
         if cfg.country:
+            static_ids = set(cfg.db_league_ids)
             for lid in ids:
                 lg = self.db.get(League, lid)
                 if lg and lg.country is None:
+                    # Only stamp country if this league is statically
+                    # listed OR its name exactly matches this group.
+                    if lid not in static_ids and not self._name_matches(
+                        lg.name, cfg.league_names
+                    ):
+                        continue
                     # Check if another league already owns (name, country)
                     conflict = self.db.scalar(
                         select(League.id)
@@ -881,16 +890,14 @@ class CanonicalLeagueService:
             old = result.get(row[0], (0, 0))
             result[row[0]] = (row[1], old[1])
 
-        # Scheduled counts grouped by league_id — same temporal window
-        # as get_upcoming() so the count matches what the user will see.
+        # Scheduled counts: ALL future scheduled matches (no window limit)
+        # so the league list shows the full picture to the user.
         now = datetime.now(timezone.utc)
-        upcoming_cutoff = now + timedelta(days=UPCOMING_DAYS_WINDOW)
         sch_stmt = (
             select(Match.league_id, func.count(Match.id))
             .where(Match.league_id.in_(league_ids))
             .where(Match.status.in_(("SCHEDULED", "NS")))
             .where(Match.utc_date >= now)
-            .where(Match.utc_date <= upcoming_cutoff)
             .group_by(Match.league_id)
         )
         for row in self.db.execute(sch_stmt):
