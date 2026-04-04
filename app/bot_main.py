@@ -29,8 +29,8 @@ from datetime import datetime, timezone as _tz
 
 from dotenv import load_dotenv
 from sqlalchemy.orm import Session
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
-from telegram.error import BadRequest, NetworkError, RetryAfter, TimedOut
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
+from telegram.error import NetworkError, RetryAfter, TimedOut
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -58,8 +58,9 @@ from app.services.payments import (
 )
 from app.services.payments.payment_service import CREDITS_PER_PURCHASE
 from app.repositories.core.user_repository import UserRepository
+from app.repositories.core.unlocked_match_repository import UnlockedMatchRepository
 from app.services.voucher_service import redeem_voucher
-from config import PREDICTION_COST, CREDIT_PACKAGES, GEMINI_API_KEY
+from config import PREDICTION_COST, CREDIT_PACKAGES  # , GEMINI_API_KEY
 
 load_dotenv()
 
@@ -81,9 +82,6 @@ DAILY_ALERT_HOUR: int = int(os.getenv("DAILY_ALERT_HOUR", "8"))  # UTC
 # Anti-spam: minimum seconds between bulk messages (Telegram limit: 30 msg/s)
 _BULK_SEND_DELAY = 0.05  # 50ms → max ~20 msg/s, well within limits
 
-# Staleness threshold for silent background refresh
-_STALE_THRESHOLD_SECS: int = 2 * 3600  # 2 hours
-
 # Per-user cooldown: ignore rapid-fire clicks from the same user
 _USER_COOLDOWN_SECS: float = 2.0
 _user_cooldowns: dict[int, float] = {}
@@ -97,6 +95,9 @@ _matches_cache: dict[int, tuple[float, list[Match]]] = {}
 # Per-chat state: waiting for odds input after /predict
 # chat_id → {"match_id": int, "result": MatchPredictionResult}
 _awaiting_odds: dict[int, dict] = {}
+
+# Per-chat state: waiting for predict number input after "🔮 Predecir" button
+_awaiting_predict: set[int] = set()
 
 
 def _cache_get(chat_id: int) -> list[Match] | None:
@@ -175,6 +176,16 @@ async def _safe_send(bot, chat_id: int | str, text: str, **kwargs) -> None:
 
 # ── Inline keyboard helpers ───────────────────────────────────────────────
 
+def _back_row(*buttons: InlineKeyboardButton) -> list[InlineKeyboardButton]:
+    """Build a row with the given buttons (convenience for navigation rows)."""
+    return list(buttons)
+
+
+_BTN_MENU = InlineKeyboardButton("🏠 Menú", callback_data="menu_back")
+_BTN_LEAGUES = InlineKeyboardButton("🏆 Ligas", callback_data="menu_leagues")
+_BTN_MATCHES = InlineKeyboardButton("📅 Partidos", callback_data="menu_matches")
+
+
 def _main_menu_keyboard() -> InlineKeyboardMarkup:
     """Return the main-menu inline keyboard attached to messages."""
     return InlineKeyboardMarkup([
@@ -201,7 +212,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = (
         f"👋 <b>¡Hola {name}!</b>\n\n"
         "Soy <b>TurboPredictions</b> — tu asistente de predicciones de fútbol "
-        "basado en el modelo estadístico <b>Dixon-Coles</b>.\n\n"
+        "basado en el modelo estadístico altamente eficiente.\n\n"
         "🧠 <b>¿Cómo funciono?</b>\n"
         "Analizo miles de partidos históricos para calcular "
         "<b>probabilidades matemáticas</b> de cada resultado (1X2, O/U, BTTS). "
@@ -344,6 +355,18 @@ async def _callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     elif data.startswith("league_"):
         idx = int(data.split("_", 1)[1])
         await _do_matches(query.message, context, canonical_index=idx)
+    elif data == "predict_ask":
+        chat_id = query.message.chat_id
+        _awaiting_predict.add(chat_id)
+        # Send as a NEW message so the match list stays visible
+        await query.message.reply_text(
+            "🔮 <b>Predecir partido</b>\n\n"
+            "Escribe el <b>número</b> del partido que quieres predecir\n"
+            "(según la lista de arriba).\n\n"
+            "<i>También puedes usar el comando /predict &lt;número&gt;</i>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[_BTN_MATCHES, _BTN_MENU]]),
+        )
     elif data.startswith("odds_"):
         match_id_str = data.split("_", 1)[1]
         chat_id = query.message.chat_id
@@ -356,11 +379,13 @@ async def _callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 "<code>cuota_local cuota_empate cuota_visitante</code>\n\n"
                 "<i>Ejemplo: 1.85 3.40 4.50</i>",
                 parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[_BTN_MATCHES, _BTN_MENU]]),
             )
         else:
             await _safe_edit_or_send(
                 query.message,
                 "⚠️ Predicción expirada. Usa /predict de nuevo.",
+                reply_markup=InlineKeyboardMarkup([[_BTN_MATCHES, _BTN_MENU]]),
             )
 
 
@@ -401,7 +426,11 @@ async def _do_leagues(message, context: ContextTypes.DEFAULT_TYPE) -> None:
         leagues = svc.list_leagues()
 
         if not leagues:
-            await _safe_edit_or_send(message, "⚠️ No hay ligas registradas en la DB.")
+            await _safe_edit_or_send(
+                message,
+                "⚠️ No hay ligas registradas en la DB.",
+                reply_markup=_main_menu_keyboard(),
+            )
             return
 
         # Separate club leagues from international competitions
@@ -457,8 +486,10 @@ async def _do_leagues(message, context: ContextTypes.DEFAULT_TYPE) -> None:
             if row:
                 keyboard_rows.append(row)
 
-        lines.append("\n<i>Toca una liga o usa /matches &lt;num&gt;</i>")
-        markup = InlineKeyboardMarkup(keyboard_rows) if keyboard_rows else None
+        lines.append("\n<i>Toca una liga para ver sus partidos.</i>")
+        # Always add back-to-menu row at the bottom
+        keyboard_rows.append([_BTN_MENU])
+        markup = InlineKeyboardMarkup(keyboard_rows)
 
         text = "\n".join(lines)
         if len(text) > 4000:
@@ -466,7 +497,11 @@ async def _do_leagues(message, context: ContextTypes.DEFAULT_TYPE) -> None:
         await _safe_edit_or_send(message, text, parse_mode="HTML", reply_markup=markup)
     except Exception:
         logger.exception("Error en /leagues")
-        await _safe_edit_or_send(message, "⚠️ Error al obtener ligas. Intenta de nuevo.")
+        await _safe_edit_or_send(
+            message,
+            "⚠️ Error al obtener ligas. Intenta de nuevo.",
+            reply_markup=_main_menu_keyboard(),
+        )
     finally:
         db.close()
 
@@ -483,6 +518,7 @@ async def cmd_matches(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await _safe_reply(
                 update,
                 "⚠️ Liga inválida. Usa /leagues para ver los números disponibles.",
+                reply_markup=InlineKeyboardMarkup([[_BTN_LEAGUES, _BTN_MENU]]),
             )
             return
 
@@ -494,7 +530,7 @@ def _render_matches(
     svc: CanonicalLeagueService,
     filter_label: str = "",
 ) -> str:
-    """Build the HTML text for a list of matches (live + scheduled + finished today)."""
+    """Build HTML text for a list of matches."""
     lines = [f"⚽ <b>Partidos{_esc(filter_label)}</b>\n"]
     current_league = ""
 
@@ -513,8 +549,7 @@ def _render_matches(
             hg = m.home_goals if m.home_goals is not None else 0
             ag = m.away_goals if m.away_goals is not None else 0
             lines.append(
-                f"  <b>{idx}.</b> 🔴 <b>EN VIVO</b> ({clock})"
-                f" [ID: {m.id}]\n"
+                f"  <b>{idx}.</b> 🔴 <b>EN VIVO</b> ({clock})\n"
                 f"      {home} <b>{hg}</b> - <b>{ag}</b> {away}{rnd}"
             )
         elif m.status == "FINISHED":
@@ -532,80 +567,12 @@ def _render_matches(
             )
 
     lines.append(
-        "\n<i>Usa /predict &lt;num&gt; para ver la predicción.\n"
-        "🔴 En vivo: /analizar &lt;ID&gt; para análisis IA.\n"
-        "Ejemplo: /predict 1</i>"
+        "\n<i>🔮 Toca <b>Predecir</b> o usa /predict &lt;número&gt;</i>"
     )
     text = "\n".join(lines)
     if len(text) > 4000:
         text = text[:3950] + "\n..."
     return text
-
-
-async def _background_ui_updater(
-    *,
-    bot: Bot,
-    chat_id: int,
-    message_id: int,
-    canonical_index: int,
-    display_name: str,
-) -> None:
-    """Fire-and-forget: ingest data from provider, then overwrite the
-    loading message with the final match list.  Owns its own DB session."""
-    try:
-        await background_ingest(canonical_index)
-
-        db = SessionLocal()
-        try:
-            svc = CanonicalLeagueService(db)
-            upcoming = svc.get_todays_matches(canonical_index)
-
-            if upcoming:
-                _cache_set(chat_id, upcoming)
-                text = _render_matches(upcoming, svc, f" — {display_name}")
-            else:
-                text = (
-                    f"📭 No hay partidos programados para "
-                    f"<b>{_esc(display_name)}</b>."
-                )
-
-            try:
-                await bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    text=text,
-                    parse_mode="HTML",
-                )
-            except BadRequest as exc:
-                logger.debug(
-                    "edit_message_text failed (chat=%d): %s", chat_id, exc,
-                )
-        finally:
-            db.close()
-    except Exception:
-        logger.exception(
-            "Error en _background_ui_updater (liga %d)", canonical_index,
-        )
-        try:
-            await bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=message_id,
-                text=(
-                    f"❌ Error obteniendo datos para "
-                    f"<b>{_esc(display_name)}</b>."
-                ),
-                parse_mode="HTML",
-            )
-        except Exception:
-            logger.debug("Failed to send error msg to chat %d", chat_id)
-
-
-def _is_stale(last_ingest: datetime | None) -> bool:
-    """Return True if the league data should be refreshed silently."""
-    if last_ingest is None:
-        return True
-    age = (datetime.now(_tz.utc) - last_ingest).total_seconds()
-    return age > _STALE_THRESHOLD_SECS
 
 
 async def _do_matches(
@@ -614,15 +581,14 @@ async def _do_matches(
     *,
     canonical_index: int | None,
 ) -> None:
-    """Always-Live match handler.
+    """Strict Fire-and-Forget match handler with DB-backed TTL.
 
-    1. Priority 1 — instant DB read.
-    2. Render decision:
-       - Matches found → show immediately.
-       - 0 matches + league previously ingested → show 'no matches'.
-       - Never ingested (last_ingest_at is NULL) → loading + UI updater.
-    3. Silent refresh — if data older than 2 h, fire-and-forget
-       background_ingest WITHOUT touching the user's message.
+    Flow (never blocks on scraping):
+      A. Query local DB → instant.
+      B. Respond to user IMMEDIATELY (even if 0 matches).
+      C. Evaluate freshness: ``now() - last_ingest_at``.
+      D. If stale (> 4 h) or never ingested → ``asyncio.create_task``
+         (no ``await`` — 100 % decoupled from the response path).
     """
     db = _db()
     try:
@@ -635,19 +601,15 @@ async def _do_matches(
                 await _safe_edit_or_send(
                     message,
                     "⚠️ Liga fuera de rango. Usa /leagues para ver los números.",
+                    reply_markup=InlineKeyboardMarkup([[_BTN_LEAGUES, _BTN_MENU]]),
                 )
                 return
 
-        # ── Fast DB read (microseconds on PostgreSQL) ─────────────────
+        # ── PASO A: Fast DB read (instant) ────────────────────────────
         upcoming = svc.get_todays_matches(canonical_index)
-        last_ingest = (
-            svc.get_last_ingest_at(canonical_index)
-            if canonical_index is not None
-            else None
-        )
 
+        # ── PASO B: Respond IMMEDIATELY ───────────────────────────────
         if upcoming:
-            # ── LIVE PATH: data exists → respond instantly ────────────
             _cache_set(message.chat_id, upcoming)
 
             filter_label = ""
@@ -655,68 +617,339 @@ async def _do_matches(
                 filter_label = f" — {leagues[canonical_index - 1].display_name}"
 
             text = _render_matches(upcoming, svc, filter_label)
-            await _safe_edit_or_send(message, text, parse_mode="HTML")
+            nav_kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔮 Predecir", callback_data="predict_ask")],
+                [_BTN_LEAGUES, _BTN_MENU],
+            ])
+            await _safe_edit_or_send(message, text, parse_mode="HTML", reply_markup=nav_kb)
 
-            # Silent background refresh if stale (user never notices)
-            if canonical_index is not None and _is_stale(last_ingest):
-                asyncio.create_task(background_ingest(canonical_index))
-            return
-
-        # ── 0 matches — decide between 'no matches' and 'loading' ─────
-        if canonical_index is not None:
+        elif canonical_index is not None:
             info = leagues[canonical_index - 1]
-
-            if last_ingest is not None:
-                # League ingested before → genuinely no scheduled games
-                await _safe_edit_or_send(
-                    message,
-                    f"📭 No hay partidos programados para "
-                    f"<b>{_esc(info.display_name)}</b>.",
-                    parse_mode="HTML",
-                )
-                # Still refresh silently if stale
-                if _is_stale(last_ingest):
-                    asyncio.create_task(background_ingest(canonical_index))
-                return
-
-            # Never ingested → true cold start with UI updater
+            nav_kb = InlineKeyboardMarkup([[_BTN_LEAGUES, _BTN_MENU]])
             await _safe_edit_or_send(
                 message,
-                f"⏳ Obteniendo datos por primera vez para "
-                f"<b>{_esc(info.display_name)}</b>.\n"
-                "Este mensaje se actualizará automáticamente.",
+                f"📭 No hay partidos para <b>{_esc(info.display_name)}</b> "
+                f"en este momento.\n",
                 parse_mode="HTML",
+                reply_markup=nav_kb,
             )
-            asyncio.create_task(
-                _background_ui_updater(
-                    bot=context.bot,
-                    chat_id=message.chat_id,
-                    message_id=message.message_id,
-                    canonical_index=canonical_index,
-                    display_name=info.display_name,
-                )
-            )
-            return
 
-        # No canonical_index and no data → empty state
-        back_btn = InlineKeyboardMarkup([[
-            InlineKeyboardButton("🏆 Ver ligas", callback_data="menu_leagues"),
-            InlineKeyboardButton("🏠 Menú", callback_data="menu_help"),
-        ]])
-        await _safe_edit_or_send(
-            message,
-            "📭 No hay partidos programados.",
-            parse_mode="HTML",
-            reply_markup=back_btn,
-        )
+        else:
+            back_btn = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🏆 Ver ligas", callback_data="menu_leagues"),
+                InlineKeyboardButton("🏠 Menú", callback_data="menu_help"),
+            ]])
+            await _safe_edit_or_send(
+                message,
+                "📭 No hay partidos en la base de datos en este momento.\n",
+                parse_mode="HTML",
+                reply_markup=back_btn,
+            )
+
+        # ── PASO C + D: Evaluate freshness → fire-and-forget if stale ─
+        # background_ingest internally checks the DB-backed 4-hour TTL
+        # (_is_stale) and the concurrency guard (_active_ingestions).
+        # asyncio.create_task → NO await → event loop stays free.
+        if canonical_index is not None:
+            asyncio.create_task(background_ingest(canonical_index))
+
     except Exception:
         logger.exception("Error en /matches")
-        await _safe_edit_or_send(message, "⚠️ Error al obtener partidos. Intenta de nuevo.")
+        await _safe_edit_or_send(
+            message,
+            "⚠️ Error al obtener partidos. Intenta de nuevo.",
+            reply_markup=_main_menu_keyboard(),
+        )
     finally:
         db.close()
 
 
 # ── /predict ──────────────────────────────────────────────────────────────
+
+
+async def _do_predict_from_text(update: Update, choice: int) -> None:
+    """Handle predict when user types the match number in chat."""
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+    if not user:
+        return
+    telegram_id: int = user.id
+
+    cached = _cache_get(chat_id)
+    if not cached:
+        await _safe_reply(
+            update,
+            "⚠️ No hay listado activo. Usa /matches primero.",
+            reply_markup=InlineKeyboardMarkup([[_BTN_MATCHES, _BTN_MENU]]),
+        )
+        return
+
+    if choice < 1 or choice > len(cached):
+        await _safe_reply(
+            update,
+            f"⚠️ Número fuera de rango. Elige entre 1 y {len(cached)}.",
+            reply_markup=InlineKeyboardMarkup([[_BTN_MATCHES, _BTN_MENU]]),
+        )
+        return
+
+    match_obj = cached[choice - 1]
+    match_id: int = match_obj.id
+
+    db = _db()
+    try:
+        user_repo = UserRepository(db)
+        unlock_repo = UnlockedMatchRepository(db)
+        already_unlocked = unlock_repo.is_unlocked(telegram_id, match_id)
+
+        if not already_unlocked:
+            user_row = user_repo.get_for_update(telegram_id)
+
+            if user_row is None:
+                user_repo.get_or_create(telegram_id=telegram_id, username=user.username)
+                user_row = user_repo.get_for_update(telegram_id)
+
+            if user_row is None or user_row.creditos < PREDICTION_COST:
+                db.rollback()
+                await _safe_reply(
+                    update,
+                    f"⚠️ Saldo insuficiente. Necesitas <b>{PREDICTION_COST}</b> créditos "
+                    f"(tienes <b>{user_row.creditos if user_row else 0}</b>).\n",
+                    parse_mode="HTML",
+                    reply_markup=_main_menu_keyboard(),
+                )
+                return
+
+        await _safe_reply(update, "🔄 Calculando predicción...")
+
+        result = None
+        try:
+            service = PredictionService(db)
+            result = service.predict_match(match_id)
+        except Exception:
+            logger.exception("Error en predict(text) (match_id=%s)", match_id)
+            db.rollback()
+            await _safe_reply(
+                update,
+                "⚠️ El motor de predicción falló. No se descontaron créditos.\n"
+                "Intenta de nuevo en unos minutos.",
+                reply_markup=InlineKeyboardMarkup([[_BTN_MATCHES, _BTN_MENU]]),
+            )
+            return
+
+        if result is None:
+            db.rollback()
+            await _safe_reply(
+                update,
+                "⚠️ No se pudo generar predicción.\n"
+                "Datos históricos insuficientes (mínimo 30 partidos).\n"
+                "No se descontaron créditos.",
+                reply_markup=InlineKeyboardMarkup([[_BTN_MATCHES, _BTN_MENU]]),
+            )
+            return
+
+        if already_unlocked:
+            db.commit()
+            new_balance = user_repo.get_for_update(telegram_id)
+            new_balance = new_balance.creditos if new_balance else 0
+            db.commit()
+            logger.info(
+                "predict(text) tg_id=%d match=%d → FREE (already unlocked)",
+                telegram_id, match_id,
+            )
+            credit_footer = (
+                "\n\n✅ Ya desbloqueaste este partido — predicción gratis."
+                f"\n💰 Créditos: <b>{new_balance}</b>"
+            )
+        else:
+            try:
+                new_balance_int: int = user_repo.deduct_credito(telegram_id, amount=PREDICTION_COST)
+                unlock_repo.unlock(telegram_id, match_id)
+                db.commit()
+            except Exception:
+                logger.exception("DB error deducting credit for tg_id=%d", telegram_id)
+                db.rollback()
+                await _safe_reply(
+                    update,
+                    "⚠️ Error interno al descontar créditos. No se realizó el cobro.",
+                    reply_markup=_main_menu_keyboard(),
+                )
+                return
+
+            logger.info(
+                "predict(text) tg_id=%d match=%d → -%d créditos (balance=%d)",
+                telegram_id, match_id, PREDICTION_COST, new_balance_int,
+            )
+            credit_footer = f"\n\n💰 Créditos restantes: <b>{new_balance_int}</b>"
+
+        _awaiting_odds[chat_id] = {"match_id": match_id, "result": result}
+
+        text = _format_prediction(result)
+        odds_btn = InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                "💰 Ingresar cuotas de casa de apuestas",
+                callback_data=f"odds_{match_id}",
+            )],
+            [_BTN_MATCHES, _BTN_MENU],
+        ])
+        await _safe_reply(
+            update, text + credit_footer,
+            parse_mode="HTML", reply_markup=odds_btn,
+        )
+    except Exception:
+        logger.exception("Unhandled error in predict(text) choice=%d", choice)
+        db.rollback()
+        await _safe_reply(
+            update,
+            "⚠️ Error inesperado. No se descontaron créditos.",
+            reply_markup=InlineKeyboardMarkup([[_BTN_MATCHES, _BTN_MENU]]),
+        )
+    finally:
+        db.close()
+
+
+async def _do_predict(query, choice: int) -> None:
+    """Shared prediction logic for inline button callbacks.
+
+    ``query`` is the CallbackQuery from the button press.
+    ``choice`` is the 1-based match index from the cached listing.
+    """
+    chat_id = query.message.chat_id
+    user = query.from_user
+    if not user:
+        return
+    telegram_id: int = user.id
+
+    cached = _cache_get(chat_id)
+    if not cached:
+        await _safe_edit_or_send(
+            query.message,
+            "⚠️ No hay listado activo. Usa /matches primero.",
+            reply_markup=InlineKeyboardMarkup([[_BTN_MATCHES, _BTN_MENU]]),
+        )
+        return
+
+    if choice < 1 or choice > len(cached):
+        await _safe_edit_or_send(
+            query.message,
+            f"⚠️ Número fuera de rango. Elige entre 1 y {len(cached)}.",
+            reply_markup=InlineKeyboardMarkup([[_BTN_MATCHES, _BTN_MENU]]),
+        )
+        return
+
+    match_obj = cached[choice - 1]
+    match_id: int = match_obj.id
+
+    db = _db()
+    try:
+        user_repo = UserRepository(db)
+        unlock_repo = UnlockedMatchRepository(db)
+        already_unlocked = unlock_repo.is_unlocked(telegram_id, match_id)
+
+        if not already_unlocked:
+            user_row = user_repo.get_for_update(telegram_id)
+
+            if user_row is None:
+                user_repo.get_or_create(telegram_id=telegram_id, username=user.username)
+                user_row = user_repo.get_for_update(telegram_id)
+
+            if user_row is None or user_row.creditos < PREDICTION_COST:
+                db.rollback()
+                await _safe_edit_or_send(
+                    query.message,
+                    f"⚠️ Saldo insuficiente. Necesitas <b>{PREDICTION_COST}</b> créditos "
+                    f"(tienes <b>{user_row.creditos if user_row else 0}</b>).\n",
+                    parse_mode="HTML",
+                    reply_markup=_main_menu_keyboard(),
+                )
+                return
+
+        await _safe_edit_or_send(query.message, "🔄 Calculando predicción...")
+
+        result = None
+        try:
+            service = PredictionService(db)
+            result = service.predict_match(match_id)
+        except Exception:
+            logger.exception("Error en predict (btn) (match_id=%s)", match_id)
+            db.rollback()
+            await _safe_edit_or_send(
+                query.message,
+                "⚠️ El motor de predicción falló. No se descontaron créditos.\n"
+                "Intenta de nuevo en unos minutos.",
+                reply_markup=InlineKeyboardMarkup([[_BTN_MATCHES, _BTN_MENU]]),
+            )
+            return
+
+        if result is None:
+            db.rollback()
+            await _safe_edit_or_send(
+                query.message,
+                "⚠️ No se pudo generar predicción.\n"
+                "Datos históricos insuficientes (mínimo 30 partidos).\n"
+                "No se descontaron créditos.",
+                reply_markup=InlineKeyboardMarkup([[_BTN_MATCHES, _BTN_MENU]]),
+            )
+            return
+
+        if already_unlocked:
+            db.commit()
+            user_row_free = user_repo.get_for_update(telegram_id)
+            bal = user_row_free.creditos if user_row_free else 0
+            db.commit()
+            logger.info(
+                "predict(btn) tg_id=%d match=%d → FREE (already unlocked)",
+                telegram_id, match_id,
+            )
+            credit_footer = (
+                "\n\n✅ Ya desbloqueaste este partido — predicción gratis."
+                f"\n💰 Créditos: <b>{bal}</b>"
+            )
+        else:
+            try:
+                new_balance: int = user_repo.deduct_credito(telegram_id, amount=PREDICTION_COST)
+                unlock_repo.unlock(telegram_id, match_id)
+                db.commit()
+            except Exception:
+                logger.exception("DB error deducting credit for tg_id=%d", telegram_id)
+                db.rollback()
+                await _safe_edit_or_send(
+                    query.message,
+                    "⚠️ Error interno al descontar créditos. No se realizó el cobro.",
+                    reply_markup=_main_menu_keyboard(),
+                )
+                return
+
+            logger.info(
+                "predict(btn) tg_id=%d match=%d → -%d créditos (balance=%d)",
+                telegram_id, match_id, PREDICTION_COST, new_balance,
+            )
+            credit_footer = f"\n\n💰 Créditos restantes: <b>{new_balance}</b>"
+
+        _awaiting_odds[chat_id] = {"match_id": match_id, "result": result}
+
+        text = _format_prediction(result)
+        odds_btn = InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                "💰 Ingresar cuotas de casa de apuestas",
+                callback_data=f"odds_{match_id}",
+            )],
+            [_BTN_MATCHES, _BTN_MENU],
+        ])
+        await _safe_edit_or_send(
+            query.message, text + credit_footer,
+            parse_mode="HTML", reply_markup=odds_btn,
+        )
+    except Exception:
+        logger.exception("Unhandled error in predict(btn) choice=%d", choice)
+        db.rollback()
+        await _safe_edit_or_send(
+            query.message,
+            "⚠️ Error inesperado. No se descontaron créditos.",
+            reply_markup=InlineKeyboardMarkup([[_BTN_MATCHES, _BTN_MENU]]),
+        )
+    finally:
+        db.close()
+
 
 async def cmd_predict(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Predict the match selected by number from /matches.
@@ -734,25 +967,35 @@ async def cmd_predict(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "ℹ️ Uso: /predict &lt;num&gt;\n\n"
             "Primero usa /matches para ver la lista.",
             parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[_BTN_MATCHES, _BTN_MENU]]),
         )
         return
 
     try:
         choice = int(context.args[0])
     except ValueError:
-        await _safe_reply(update, "⚠️ El número debe ser un entero. Ejemplo: /predict 1")
+        await _safe_reply(
+            update,
+            "⚠️ El número debe ser un entero. Ejemplo: /predict 1",
+            reply_markup=InlineKeyboardMarkup([[_BTN_MATCHES, _BTN_MENU]]),
+        )
         return
 
     chat_id = update.effective_chat.id
     cached = _cache_get(chat_id)
     if not cached:
-        await _safe_reply(update, "⚠️ No hay listado activo. Usa /matches primero.")
+        await _safe_reply(
+            update,
+            "⚠️ No hay listado activo. Usa /matches primero.",
+            reply_markup=InlineKeyboardMarkup([[_BTN_MATCHES, _BTN_MENU]]),
+        )
         return
 
     if choice < 1 or choice > len(cached):
         await _safe_reply(
             update,
             f"⚠️ Número fuera de rango. Elige entre 1 y {len(cached)}.",
+            reply_markup=InlineKeyboardMarkup([[_BTN_MATCHES, _BTN_MENU]]),
         )
         return
 
@@ -767,31 +1010,36 @@ async def cmd_predict(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     db = _db()
     try:
         user_repo = UserRepository(db)
-        user_row = user_repo.get_for_update(telegram_id)
+        unlock_repo = UnlockedMatchRepository(db)
+        already_unlocked = unlock_repo.is_unlocked(telegram_id, match_id)
 
-        if user_row is None:
-            user_repo.get_or_create(telegram_id=telegram_id, username=user.username)
+        if not already_unlocked:
             user_row = user_repo.get_for_update(telegram_id)
 
-        if user_row is None or user_row.creditos < PREDICTION_COST:
-            db.rollback()
-            buy_link: str = ""
-            try:
-                provider = PaymentFactory.create(Gateway.MERCADOPAGO)
-                pay_svc = PaymentService(_db(), provider)
-                buy_link = await pay_svc.create_checkout(telegram_id)
-            except Exception:
-                logger.debug("Could not generate payment link for insufficient-credits msg")
+            if user_row is None:
+                user_repo.get_or_create(telegram_id=telegram_id, username=user.username)
+                user_row = user_repo.get_for_update(telegram_id)
 
-            # link_text: str = buy_link if buy_link else "/comprar"
-            await _safe_reply(
-                update,
-                f"⚠️ Saldo insuficiente. Necesitas <b>{PREDICTION_COST}</b> créditos "
-                f"(tienes <b>{user_row.creditos if user_row else 0}</b>).\n",
-                # f"Compra más créditos aquí: {link_text}",
-                parse_mode="HTML",
-            )
-            return
+            if user_row is None or user_row.creditos < PREDICTION_COST:
+                db.rollback()
+                buy_link: str = ""
+                try:
+                    provider = PaymentFactory.create(Gateway.MERCADOPAGO)
+                    pay_svc = PaymentService(_db(), provider)
+                    buy_link = await pay_svc.create_checkout(telegram_id)
+                except Exception:
+                    logger.debug("Could not generate payment link for insufficient-credits msg")
+
+                # link_text: str = buy_link if buy_link else "/comprar"
+                await _safe_reply(
+                    update,
+                    f"⚠️ Saldo insuficiente. Necesitas <b>{PREDICTION_COST}</b> créditos "
+                    f"(tienes <b>{user_row.creditos if user_row else 0}</b>).\n",
+                    # f"Compra más créditos aquí: {link_text}",
+                    parse_mode="HTML",
+                    reply_markup=_main_menu_keyboard(),
+                )
+                return
 
         # ── 2. Ejecutar predicción (CPU-heavy) ───────────────────────
         await _safe_reply(update, "🔄 Calculando predicción...")
@@ -807,6 +1055,7 @@ async def cmd_predict(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 update,
                 "⚠️ El motor de predicción falló. No se descontaron créditos.\n"
                 "Intenta de nuevo en unos minutos.",
+                reply_markup=InlineKeyboardMarkup([[_BTN_MATCHES, _BTN_MENU]]),
             )
             return
 
@@ -817,27 +1066,44 @@ async def cmd_predict(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 "⚠️ No se pudo generar predicción.\n"
                 "Datos históricos insuficientes (mínimo 30 partidos).\n"
                 "No se descontaron créditos.",
+                reply_markup=InlineKeyboardMarkup([[_BTN_MATCHES, _BTN_MENU]]),
             )
             return
 
-        # ── 3. Predicción exitosa → descontar créditos y commit ────
-        try:
-            new_balance: int = user_repo.deduct_credito(telegram_id, amount=PREDICTION_COST)
+        # ── 3. Predicción exitosa → descontar créditos o gratis ────
+        if already_unlocked:
             db.commit()
-        except Exception:
-            logger.exception("DB error deducting credit for tg_id=%d", telegram_id)
-            db.rollback()
-            await _safe_reply(
-                update,
-                "⚠️ Error interno al descontar créditos. No se realizó el cobro.\n"
-                "Intenta de nuevo.",
+            user_row_free = user_repo.get_for_update(telegram_id)
+            bal = user_row_free.creditos if user_row_free else 0
+            db.commit()
+            logger.info(
+                "/predict tg_id=%d match=%d → FREE (already unlocked)",
+                telegram_id, match_id,
             )
-            return
+            credit_footer = (
+                "\n\n✅ Ya desbloqueaste este partido — predicción gratis."
+                f"\n💰 Créditos: <b>{bal}</b>"
+            )
+        else:
+            try:
+                new_balance: int = user_repo.deduct_credito(telegram_id, amount=PREDICTION_COST)
+                unlock_repo.unlock(telegram_id, match_id)
+                db.commit()
+            except Exception:
+                logger.exception("DB error deducting credit for tg_id=%d", telegram_id)
+                db.rollback()
+                await _safe_reply(
+                    update,
+                    "⚠️ Error interno al descontar créditos. No se realizó el cobro.\n"
+                    "Intenta de nuevo.",
+                )
+                return
 
-        logger.info(
-            "/predict tg_id=%d match=%d → -%d créditos (balance=%d)",
-            telegram_id, match_id, PREDICTION_COST, new_balance,
-        )
+            logger.info(
+                "/predict tg_id=%d match=%d → -%d créditos (balance=%d)",
+                telegram_id, match_id, PREDICTION_COST, new_balance,
+            )
+            credit_footer = f"\n\n💰 Créditos restantes: <b>{new_balance}</b>"
 
         # ── 4. Enviar resultado al usuario ────────────────────────────
         _awaiting_odds[chat_id] = {"match_id": match_id, "result": result}
@@ -869,12 +1135,12 @@ async def cmd_predict(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 logger.debug("Could not send team badge")
 
         text = _format_prediction(result)
-        credit_footer: str = f"\n\n💰 Créditos restantes: <b>{new_balance}</b>"
         odds_btn = InlineKeyboardMarkup([
             [InlineKeyboardButton(
                 "💰 Ingresar cuotas de casa de apuestas",
                 callback_data=f"odds_{match_id}",
             )],
+            [_BTN_MATCHES, _BTN_MENU],
         ])
         await _safe_reply(
             update, text + credit_footer, parse_mode="HTML", reply_markup=odds_btn,
@@ -886,6 +1152,7 @@ async def cmd_predict(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             update,
             "⚠️ Error inesperado. No se descontaron créditos.\n"
             "Intenta de nuevo en unos minutos.",
+            reply_markup=InlineKeyboardMarkup([[_BTN_MATCHES, _BTN_MENU]]),
         )
     finally:
         db.close()
@@ -969,7 +1236,7 @@ def _format_prediction(result) -> str:
         lines.append(f"\n🥅 <b>Marcadores más probables</b>\n    {', '.join(scores)}")
 
     lines.append("━━━━━━━━━━━━━━━━━━━━━")
-    lines.append("<i>💡 Toca el botón de abajo para analizar con tus cuotas.</i>")
+    lines.append("<i>💡 Toca el botón de abajo para comparar con tus cuotas.</i>")
 
     text = "\n".join(lines)
     if len(text) > 4000:
@@ -1224,10 +1491,15 @@ async def cmd_creditos(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             f"💰 <b>Tus créditos:</b> {balance}\n\n",
             # f"Usa /comprar para adquirir más.",
             parse_mode="HTML",
+            reply_markup=_main_menu_keyboard(),
         )
     except Exception:
         logger.exception("Error en /creditos para user %s", user.id)
-        await _safe_reply(update, "⚠️ Error al consultar créditos.")
+        await _safe_reply(
+            update,
+            "⚠️ Error al consultar créditos.",
+            reply_markup=_main_menu_keyboard(),
+        )
     finally:
         db.close()
 
@@ -1241,7 +1513,11 @@ async def cmd_canjear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     if not context.args:
-        await _safe_reply(update, "❌ Formato incorrecto. Uso: /canjear CODIGO")
+        await _safe_reply(
+            update,
+            "❌ Formato incorrecto. Uso: /canjear CODIGO",
+            reply_markup=_main_menu_keyboard(),
+        )
         return
 
     codigo_limpio = context.args[0].strip().upper()
@@ -1254,12 +1530,21 @@ async def cmd_canjear(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             f"✅ ¡Canje exitoso! Se sumaron <b>{creditos}</b> créditos a tu cuenta.\n"
             f"Tu nuevo saldo es: <b>{nuevo_saldo}</b>",
             parse_mode="HTML",
+            reply_markup=_main_menu_keyboard(),
         )
     except ValueError as exc:
-        await _safe_reply(update, f"❌ Error al canjear: {exc}")
+        await _safe_reply(
+            update,
+            f"❌ Error al canjear: {exc}",
+            reply_markup=_main_menu_keyboard(),
+        )
     except Exception:
         logger.exception("Error en /canjear para user %s", user.id)
-        await _safe_reply(update, "⚠️ Error inesperado al canjear el voucher.")
+        await _safe_reply(
+            update,
+            "⚠️ Error inesperado al canjear el voucher.",
+            reply_markup=_main_menu_keyboard(),
+        )
     finally:
         db.close()
 
@@ -1292,12 +1577,14 @@ async def _do_valuebets(message, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
         text = _format_value_bets(bets, db)
-        await _safe_edit_or_send(message, text, parse_mode="HTML")
+        nav_kb = InlineKeyboardMarkup([[_BTN_LEAGUES, _BTN_MATCHES, _BTN_MENU]])
+        await _safe_edit_or_send(message, text, parse_mode="HTML", reply_markup=nav_kb)
     except Exception:
         logger.exception("Error en /valuebets")
         await _safe_edit_or_send(
             message,
             "⚠️ Error al obtener value bets. Intenta de nuevo.",
+            reply_markup=_main_menu_keyboard(),
         )
     finally:
         db.close()
@@ -1408,6 +1695,22 @@ async def _fallback_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     chat_id = update.effective_chat.id
     text = (update.message.text or "").strip()
 
+    # Check if user is providing a predict number
+    if chat_id in _awaiting_predict:
+        try:
+            choice = int(text)
+        except ValueError:
+            await _safe_reply(
+                update,
+                "⚠️ Ingresa solo el <b>número</b> del partido. Ejemplo: <b>3</b>",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[_BTN_MATCHES, _BTN_MENU]]),
+            )
+            return
+        _awaiting_predict.discard(chat_id)
+        await _do_predict_from_text(update, choice)
+        return
+
     # Check if user is providing odds
     pending = _awaiting_odds.get(chat_id)
     if pending:
@@ -1427,6 +1730,7 @@ async def _fallback_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     "⚠️ Formato inválido. Las cuotas deben ser números mayores a 1.0\n"
                     "<i>Ejemplo: 1.85 3.40 4.50</i>",
                     parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([[_BTN_MATCHES, _BTN_MENU]]),
                 )
                 return
 
@@ -1467,6 +1771,10 @@ async def _hydrate_all_leagues() -> None:
     Each league ingestion is isolated (its own DB session inside
     ``background_ingest``).  A 15-second delay between leagues prevents
     the ESPN scraper from being rate-limited.
+
+    ``background_ingest`` checks the DB-backed 4-hour TTL internally,
+    so on a restart leagues that were ingested recently are skipped
+    automatically — no massive re-scraping.
     """
     total: int = len(LEAGUE_GROUPS)
     logger.info("Hydration: starting for %d leagues", total)
@@ -1495,76 +1803,94 @@ async def _scheduled_hydration(context: ContextTypes.DEFAULT_TYPE) -> None:
     asyncio.create_task(_hydrate_all_leagues(), name="scheduled-hydration")
 
 
-# ── /analizar ─────────────────────────────────────────────────────────────
-
-async def cmd_analizar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Análisis IA en vivo de un partido usando Gemini 1.5 Flash."""
-    if not context.args:
-        await _safe_reply(
-            update,
-            "ℹ️ Uso: /analizar &lt;ID&gt;\n\n"
-            "Usa /matches para ver los partidos en vivo con su ID.",
-            parse_mode="HTML",
-        )
-        return
-
-    try:
-        match_id = int(context.args[0])
-    except ValueError:
-        await _safe_reply(update, "⚠️ El ID debe ser un número. Ejemplo: /analizar 8472")
-        return
-
-    db = _db()
-    try:
-        from app.repositories.football.match_repository import MatchRepository
-        repo = MatchRepository(db)
-        match = repo.get_by_id(match_id)
-
-        if match is None:
-            await _safe_reply(update, "❌ No se encontró ningún partido con ese ID.")
-            return
-
-        if match.status != "IN_PLAY" or not match.clock_display:
-            await _safe_reply(
-                update,
-                "❌ Solo puedo analizar partidos que se están jugando en este momento.",
-            )
-            return
-
-        # Send loading message, then edit with result
-        loading_msg = await update.message.reply_text("⏳ Analizando el partido con IA...")
-
-        from app.services.ai_service import analyze_live_match
-
-        if not GEMINI_API_KEY:
-            await loading_msg.edit_text("⚠️ GEMINI_API_KEY no configurada. Contacta al administrador.")
-            return
-
-        analysis = await analyze_live_match(match, api_key=GEMINI_API_KEY)
-
-        home = _esc(match.home_team.name if match.home_team else "?")
-        away = _esc(match.away_team.name if match.away_team else "?")
-        hg = match.home_goals if match.home_goals is not None else 0
-        ag = match.away_goals if match.away_goals is not None else 0
-        clock = _esc(match.clock_display)
-
-        header = (
-            f"🔴 <b>Análisis EN VIVO</b> ({clock})\n"
-            f"⚽ {home} <b>{hg}</b> - <b>{ag}</b> {away}\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-        )
-
-        text = header + _esc(analysis)
-        if len(text) > 4000:
-            text = text[:3950] + "\n..."
-
-        await loading_msg.edit_text(text, parse_mode="HTML")
-
-    except Exception:
-        logger.exception("Error en /analizar (match_id=%s)", context.args[0])
-        await _safe_reply(update, "⚠️ Error al generar el análisis. Intenta de nuevo.")
-    finally:
-        db.close()
+# ── /analizar (Gemini AI — deshabilitado, reservado para futuro) ──────────
+#
+# async def cmd_analizar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+#     """Análisis IA en vivo de un partido usando Gemini 1.5 Flash."""
+#     if not context.args:
+#         await _safe_reply(
+#             update,
+#             "ℹ️ Uso: /analizar &lt;ID&gt;\n\n"
+#             "Usa /matches para ver los partidos en vivo con su ID.",
+#             parse_mode="HTML",
+#             reply_markup=InlineKeyboardMarkup([[_BTN_MATCHES, _BTN_MENU]]),
+#         )
+#         return
+#
+#     try:
+#         match_id = int(context.args[0])
+#     except ValueError:
+#         await _safe_reply(
+#             update,
+#             "⚠️ El ID debe ser un número. Ejemplo: /analizar 8472",
+#             reply_markup=InlineKeyboardMarkup([[_BTN_MATCHES, _BTN_MENU]]),
+#         )
+#         return
+#
+#     db = _db()
+#     try:
+#         from app.repositories.football.match_repository import MatchRepository
+#         repo = MatchRepository(db)
+#         match = repo.get_by_id(match_id)
+#
+#         if match is None:
+#             await _safe_reply(
+#                 update,
+#                 "❌ No se encontró ningún partido con ese ID.",
+#                 reply_markup=InlineKeyboardMarkup([[_BTN_MATCHES, _BTN_MENU]]),
+#             )
+#             return
+#
+#         if match.status != "IN_PLAY" or not match.clock_display:
+#             await _safe_reply(
+#                 update,
+#                 "❌ Solo puedo analizar partidos que se están jugando en este momento.",
+#                 reply_markup=InlineKeyboardMarkup([[_BTN_MATCHES, _BTN_MENU]]),
+#             )
+#             return
+#
+#         loading_msg = await update.message.reply_text("⏳ Analizando el partido con IA...")
+#
+#         from app.services.ai_service import analyze_live_match
+#         from config import GEMINI_API_KEY
+#
+#         if not GEMINI_API_KEY:
+#             await loading_msg.edit_text(
+#                 "⚠️ GEMINI_API_KEY no configurada. Contacta al administrador.",
+#                 reply_markup=_main_menu_keyboard(),
+#             )
+#             return
+#
+#         analysis = await analyze_live_match(match, api_key=GEMINI_API_KEY)
+#
+#         home = _esc(match.home_team.name if match.home_team else "?")
+#         away = _esc(match.away_team.name if match.away_team else "?")
+#         hg = match.home_goals if match.home_goals is not None else 0
+#         ag = match.away_goals if match.away_goals is not None else 0
+#         clock = _esc(match.clock_display)
+#
+#         header = (
+#             f"🔴 <b>Análisis EN VIVO</b> ({clock})\n"
+#             f"⚽ {home} <b>{hg}</b> - <b>{ag}</b> {away}\n"
+#             f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+#         )
+#
+#         text = header + _esc(analysis)
+#         if len(text) > 4000:
+#             text = text[:3950] + "\n..."
+#
+#         nav_kb = InlineKeyboardMarkup([[_BTN_MATCHES, _BTN_MENU]])
+#         await loading_msg.edit_text(text, parse_mode="HTML", reply_markup=nav_kb)
+#
+#     except Exception:
+#         logger.exception("Error en /analizar (match_id=%s)", context.args[0])
+#         await _safe_reply(
+#             update,
+#             "⚠️ Error al generar el análisis. Intenta de nuevo.",
+#             reply_markup=InlineKeyboardMarkup([[_BTN_MATCHES, _BTN_MENU]]),
+#         )
+#     finally:
+#         db.close()
 
 
 # ── main ──────────────────────────────────────────────────────────────────
@@ -1587,7 +1913,7 @@ def main() -> None:
     # app.add_handler(CommandHandler("comprar", cmd_comprar))
     app.add_handler(CommandHandler("creditos", cmd_creditos))
     app.add_handler(CommandHandler("canjear", cmd_canjear))
-    app.add_handler(CommandHandler("analizar", cmd_analizar))
+    # app.add_handler(CommandHandler("analizar", cmd_analizar))  # Gemini AI — disabled for now
 
     # Inline button handler (main menu + league selection)
     app.add_handler(CallbackQueryHandler(_callback_handler))

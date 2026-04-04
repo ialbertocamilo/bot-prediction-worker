@@ -219,7 +219,9 @@ class MatchIngestService:
         self,
         canonical_match: CanonicalMatch,
     ) -> int:
-        league_name: str = canonical_match.league_name or "Unknown League"
+        league_name: str = canonical_match.league_name or "Uncategorized"
+        if league_name == "Unknown League":
+            league_name = "Uncategorized"
 
         league = self.league_repo.get_or_create(
             name=league_name,

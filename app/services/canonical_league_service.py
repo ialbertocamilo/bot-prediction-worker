@@ -602,60 +602,104 @@ class CanonicalLeagueService:
 
         return await self._async_ingest_from_provider(cfg)
 
+    async def async_refresh(self, canonical_index: int) -> int:
+        """Always refresh from provider (upsert) — used by background_ingest.
+
+        Unlike async_auto_ingest_if_empty, this does NOT skip when matches
+        already exist.  The underlying MatchIngestService uses external_id
+        and signature-based dedup, so existing matches are updated in-place
+        (upsert) without creating duplicates.
+        """
+        leagues = self.list_leagues()
+        if canonical_index < 1 or canonical_index > len(leagues):
+            return 0
+        info = leagues[canonical_index - 1]
+        cfg = self._groups.get(info.key)
+        if not cfg or not cfg.provider_name:
+            return 0
+
+        return await self._async_ingest_from_provider(cfg)
+
     async def _async_ingest_from_provider(
         self,
         cfg: _LeagueGroup,
         days_back: int = 60,
         days_ahead: int = 14,
     ) -> int:
-        """Async ingest: HTTP via httpx, DB writes via sync SQLAlchemy."""
+        """Async ingest: HTTP via httpx, DB writes offloaded to thread.
+
+        Fetches all events in a single pass (results + fixtures) to avoid
+        querying ESPN twice for the same date range.
+
+        Sync DB writes run in ``asyncio.to_thread()`` to avoid blocking
+        the Telegram event loop.
+        """
         logger.info(
             "Async ingest: '%s' desde %s (slug=%s)",
             cfg.display_name, cfg.provider_name, cfg.provider_slug,
         )
 
         from app.providers.espn_scraper.client import EspnScraperClient
-        from app.providers.espn_scraper.provider import EspnScraperProvider
+        from app.providers.espn_scraper.mapper import EspnScraperMapper
 
         client = EspnScraperClient(league_slug=cfg.provider_slug)
-        provider = EspnScraperProvider(client=client)
 
         d_from = date.today() - timedelta(days=days_back)
         d_to = date.today() + timedelta(days=days_ahead)
-        season = cfg.provider_season or int(os.getenv("DEFAULT_SEASON", "2026"))
-        ext_id = cfg.provider_league_id or 0
 
-        # Fetch results + fixtures concurrently via async HTTP
-        results, fixtures = await asyncio.gather(
-            provider.aget_results(
-                league_id=ext_id, season=season, date_from=d_from, date_to=d_to,
-            ),
-            provider.aget_fixtures(
-                league_id=ext_id, season=season, date_from=d_from, date_to=d_to,
-            ),
-        )
-        all_m = results + fixtures
+        # Single ESPN fetch — split into results/fixtures locally
+        raw_events = await client.aget_matches_in_range(d_from, d_to)
+
+        if not raw_events:
+            logger.info("Async ingest: 0 partidos para '%s'", cfg.display_name)
+            return 0
+
+        # Determine the canonical league name for events missing it.
+        # Priority: event["leagues"][0]["name"] → cfg.league_names[0]
+        cfg_league_name = cfg.league_names[0] if cfg.league_names else cfg.display_name
+
+        all_m: list = []
+        for event in raw_events:
+            m = EspnScraperMapper.map_match(event)
+            if m.league_name is None:
+                # Try ESPN event-level league name first
+                for lg_data in event.get("leagues", []):
+                    name = lg_data.get("name")
+                    if name:
+                        m = m.model_copy(update={"league_name": name})
+                        break
+            if m.league_name is None:
+                # Final fallback: configured league name from LEAGUE_GROUPS
+                m = m.model_copy(update={"league_name": cfg_league_name})
+            all_m.append(m)
 
         if not all_m:
             logger.info("Async ingest: 0 partidos para '%s'", cfg.display_name)
             return 0
 
-        # DB writes are fast — keep sync
-        from app.services.ingest.match_ingest_service import MatchIngestService
+        # ── Sync DB writes offloaded to a worker thread ───────────────
+        # This prevents blocking the asyncio event loop while SQLAlchemy
+        # performs I/O against PostgreSQL.
+        def _sync_db_write() -> int:
+            from app.services.ingest.match_ingest_service import MatchIngestService
 
-        svc = MatchIngestService(self.db)
-        ids = svc.ingest_matches(all_m)
-        self.db.commit()
+            svc = MatchIngestService(self.db)
+            ids = svc.ingest_matches(all_m)
+            self.db.commit()
 
-        self._rebuild_mappings()
-        self._fix_league_metadata(cfg)
-        self._stamp_ingest_ts(cfg)
+            self._rebuild_mappings()
+            self._fix_league_metadata(cfg)
+            self._stamp_ingest_ts(cfg)
+            return len(ids)
+
+        import asyncio
+        count = await asyncio.to_thread(_sync_db_write)
 
         logger.info(
             "Async ingest: %d partidos para '%s' (provider=%s)",
-            len(ids), cfg.display_name, cfg.provider_name,
+            count, cfg.display_name, cfg.provider_name,
         )
-        return len(ids)
+        return count
 
     def ingest_league(self, key: str, days_back: int = 180, days_ahead: int = 30) -> int:
         """Ingest results + fixtures for a league group by key.
@@ -710,6 +754,12 @@ class CanonicalLeagueService:
             league_id=ext_id, season=season, date_from=d_from, date_to=d_to,
         )
         all_m = results + fixtures
+
+        # Stamp league_name on matches where the provider returned None
+        cfg_league_name = cfg.league_names[0] if cfg.league_names else cfg.display_name
+        for i, m in enumerate(all_m):
+            if m.league_name is None:
+                all_m[i] = m.model_copy(update={"league_name": cfg_league_name})
 
         if not all_m:
             logger.info("Ingest: 0 partidos obtenidos para '%s'", cfg.display_name)
@@ -1024,36 +1074,76 @@ class CanonicalLeagueService:
 
 _active_ingestions: set[int] = set()
 
+# Data freshness TTL: if a league's last_ingest_at is older than this,
+# a background refresh is warranted.  Persisted in DB (survives restarts).
+_FRESHNESS_TTL_SECS: float = 4 * 3600  # 4 hours
 
-async def background_ingest(canonical_index: int) -> None:
+
+def _is_stale(canonical_index: int) -> bool:
+    """Return True if the league's DB data is older than the freshness TTL
+    or has never been ingested.  Uses a cheap DB query on ``last_ingest_at``.
+
+    This replaces the old in-memory 2-minute throttle with a persistent
+    4-hour TTL that survives process restarts.
+    """
+    from app.db.session import SessionLocal as _SL
+
+    db = _SL()
+    try:
+        svc = CanonicalLeagueService(db)
+        last = svc.get_last_ingest_at(canonical_index)
+        if last is None:
+            return True  # never ingested
+        from datetime import datetime, timezone
+        age = (datetime.now(timezone.utc) - last).total_seconds()
+        return age >= _FRESHNESS_TTL_SECS
+    finally:
+        db.close()
+
+
+async def background_ingest(canonical_index: int) -> int:
     """Fire-and-forget coroutine for background provider ingest.
 
     Owns its own DB session so the caller can return immediately.
     Designed to be launched via ``asyncio.create_task()``.
 
-    A module-level ``_active_ingestions`` set acts as an in-memory guard:
-    if the same ``canonical_index`` is already being ingested, the call
-    returns immediately to avoid duplicate ESPN requests and DB collisions.
+    Guards:
+    - ``_active_ingestions``: prevents concurrent ESPN calls for the same league.
+    - ``_is_stale``: DB-backed 4-hour TTL — skips if data is still fresh.
+
+    On success, ``_stamp_ingest_ts`` updates ``last_ingest_at`` in the DB,
+    so a restart won't trigger massive re-scraping of fresh leagues.
+
+    Returns the number of matches upserted.
     """
     if canonical_index in _active_ingestions:
         logger.debug(
             "Background ingest: league %d already in progress — skipping",
             canonical_index,
         )
-        return
+        return 0
+
+    if not _is_stale(canonical_index):
+        logger.debug(
+            "Background ingest: league %d still fresh (< 4 h TTL) — skipping",
+            canonical_index,
+        )
+        return 0
 
     _active_ingestions.add(canonical_index)
     db = SessionLocal()
     try:
         svc = CanonicalLeagueService(db)
-        ingested = await svc.async_auto_ingest_if_empty(canonical_index)
+        ingested = await svc.async_refresh(canonical_index)
         if ingested:
             logger.info(
-                "Background ingest: %d partidos nuevos (liga %d)",
+                "Background ingest: %d partidos upserted (liga %d)",
                 ingested, canonical_index,
             )
+        return ingested
     except Exception:
         logger.exception("Error en background ingest (liga %d)", canonical_index)
+        return 0
     finally:
         db.close()
         _active_ingestions.discard(canonical_index)
