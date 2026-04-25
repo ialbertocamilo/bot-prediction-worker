@@ -5,8 +5,8 @@ services:
       target: api
     restart: unless-stopped
     env_file: .env
-    ports:
-      - "8000:8000"
+#    ports:
+#      - "8000:8000"
 
   bot:
     build:
