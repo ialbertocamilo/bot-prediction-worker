@@ -1,0 +1,27 @@
+services:
+  api:
+    build:
+      context: .
+      target: api
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8000:8000"
+
+  bot:
+    build:
+      context: .
+      target: bot
+    restart: unless-stopped
+    env_file: .env
+
+  worker:
+    build:
+      context: .
+      target: worker
+    restart: "no"
+    env_file: .env
+
+volumes:
+  pgdata:
+
