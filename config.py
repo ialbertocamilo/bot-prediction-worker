@@ -55,14 +55,7 @@ CREDIT_PACKAGES: list[dict] = [
 
 # ── App Base URL (ngrok / dominio público) ───────────────────────────────
 # Requerido por los providers de pago para notification_url y back_urls.
-_raw_base_url = os.getenv("APP_BASE_URL", "").rstrip("/")
-if not _raw_base_url:
-    raise RuntimeError(
-        "FATAL: APP_BASE_URL no configurada en .env — "
-        "los webhooks de Mercado Pago y PayPal no funcionarán. "
-        "Ejemplo: APP_BASE_URL=https://tu-subdominio.ngrok-free.dev"
-    )
-APP_BASE_URL: str = _raw_base_url
+APP_BASE_URL: str = os.getenv("APP_BASE_URL", "").rstrip("/")
 
 # ── Gemini AI ─────────────────────────────────────────────────────────────
 GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
