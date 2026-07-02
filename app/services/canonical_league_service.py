@@ -23,6 +23,10 @@ from app.db.models.football.league import League
 from app.db.models.football.match import Match
 from app.db.session import SessionLocal
 from app.repositories.football.match_repository import MatchRepository
+from app.services.match_status import (
+    PREDICTABLE_FUTURE_MATCH_STATUSES,
+    is_predictable_future_match,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -474,7 +478,7 @@ class CanonicalLeagueService:
         canonical_index: int | None = None,
         days_ahead: int = UPCOMING_DAYS_WINDOW,
     ) -> list[Match]:
-        """Devuelve partidos SCHEDULED deduplicados.
+        """Devuelve partidos futuros predecibles deduplicados.
 
         canonical_index: 1-based (de list_leagues). None → todas las ligas.
         """
@@ -494,7 +498,7 @@ class CanonicalLeagueService:
         else:
             all_m = repo.list_by_date_range(date_from=now, date_to=date_to)
 
-        upcoming = [m for m in all_m if m.status in ("SCHEDULED", "NS")]
+        upcoming = [m for m in all_m if is_predictable_future_match(m.status)]
         upcoming = self._dedup(upcoming)
         upcoming.sort(key=lambda m: m.utc_date or datetime.min.replace(tzinfo=timezone.utc))
         return upcoming
@@ -504,7 +508,7 @@ class CanonicalLeagueService:
         canonical_index: int | None = None,
         days_ahead: int = UPCOMING_DAYS_WINDOW,
     ) -> list[Match]:
-        """Devuelve partidos de hoy (EN VIVO + TERMINADOS) + próximos SCHEDULED.
+        """Devuelve partidos de hoy (EN VIVO + TERMINADOS) + próximos predecibles.
 
         Orden: EN VIVO primero, luego PROGRAMADOS (hoy+futuro), luego TERMINADOS hoy.
         """
@@ -535,7 +539,7 @@ class CanonicalLeagueService:
         live = [m for m in all_m if m.status == "IN_PLAY"]
         live.sort(key=lambda m: m.utc_date or _min_dt)
 
-        scheduled = [m for m in all_m if m.status in ("SCHEDULED", "NS")]
+        scheduled = [m for m in all_m if is_predictable_future_match(m.status)]
         scheduled.sort(key=lambda m: m.utc_date or _min_dt)
 
         # Only today's finished (not future dates obviously)
@@ -915,7 +919,7 @@ class CanonicalLeagueService:
         sch = self.db.scalar(
             select(func.count(Match.id))
             .where(Match.league_id.in_(league_ids))
-            .where(Match.status.in_(("SCHEDULED", "NS")))
+            .where(Match.status.in_(PREDICTABLE_FUTURE_MATCH_STATUSES))
         ) or 0
         return fin, sch
 
@@ -946,7 +950,7 @@ class CanonicalLeagueService:
         sch_stmt = (
             select(Match.league_id, func.count(Match.id))
             .where(Match.league_id.in_(league_ids))
-            .where(Match.status.in_(("SCHEDULED", "NS")))
+            .where(Match.status.in_(PREDICTABLE_FUTURE_MATCH_STATUSES))
             .where(Match.utc_date >= now)
             .group_by(Match.league_id)
         )

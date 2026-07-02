@@ -18,6 +18,7 @@ from app.db.models.prediction.prediction import Prediction
 from app.repositories.prediction.market_odds_repository import MarketOddsRepository
 from app.repositories.prediction.model_repository import ModelRepository
 from app.repositories.prediction.prediction_repository import PredictionRepository
+from app.services.match_status import PREDICTABLE_FUTURE_MATCH_STATUSES
 
 logger = logging.getLogger(__name__)
 
@@ -225,7 +226,7 @@ class ValueService:
         """Find matches with the highest positive edge.
 
         Returns up to *limit* entries sorted by max edge descending.
-        Only considers future SCHEDULED matches.
+        Only considers future predictable matches.
         Uses batch queries instead of per-match lookups (N+1 fix).
         """
         from datetime import datetime, timezone
@@ -238,7 +239,7 @@ class ValueService:
         stmt = (
             select(Match.id, Prediction.p_home, Prediction.p_draw, Prediction.p_away)
             .join(Prediction, Prediction.match_id == Match.id)
-            .where(Match.status.in_(("SCHEDULED", "NS")))
+            .where(Match.status.in_(PREDICTABLE_FUTURE_MATCH_STATUSES))
             .where(Match.utc_date >= datetime.now(timezone.utc))
             .where(Prediction.model_id == model_rec.id)
         )

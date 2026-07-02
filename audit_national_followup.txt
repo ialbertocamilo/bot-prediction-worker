@@ -1,0 +1,71 @@
+=== INTERNATIONAL TEAMS WITH DOMESTIC KEY ===
+team_id=536 | Albania | type=CLUB | domestic=championship | national=None
+team_id=559 | Austria | type=CLUB | domestic=championship | national=None
+team_id=556 | Belgium | type=CLUB | domestic=championship | national=None
+team_id=555 | Croatia | type=CLUB | domestic=championship | national=None
+team_id=549 | Czechia | type=CLUB | domestic=championship | national=None
+team_id=569 | Denmark | type=CLUB | domestic=championship | national=None
+team_id=644 | England | type=CLUB | domestic=championship | national=None
+team_id=580 | France | type=CLUB | domestic=championship | national=None
+team_id=561 | Georgia | type=CLUB | domestic=championship | national=None
+team_id=568 | Germany | type=CLUB | domestic=championship | national=None
+team_id=584 | Hungary | type=CLUB | domestic=championship | national=None
+team_id=557 | Italy | type=CLUB | domestic=championship | national=None
+team_id=560 | Netherlands | type=CLUB | domestic=championship | national=None
+team_id=539 | Poland | type=CLUB | domestic=championship | national=None
+team_id=582 | Portugal | type=CLUB | domestic=championship | national=None
+team_id=541 | Romania | type=CLUB | domestic=championship | national=None
+team_id=570 | Scotland | type=CLUB | domestic=championship | national=None
+team_id=558 | Serbia | type=CLUB | domestic=championship | national=None
+team_id=567 | Slovakia | type=CLUB | domestic=championship | national=None
+team_id=575 | Slovenia | type=CLUB | domestic=championship | national=None
+team_id=564 | Spain | type=CLUB | domestic=championship | national=None
+team_id=577 | Switzerland | type=CLUB | domestic=championship | national=None
+team_id=562 | T³rkiye | type=CLUB | domestic=championship | national=None
+team_id=579 | Ukraine | type=CLUB | domestic=championship | national=None
+
+=== LEAGUES FOR SELECTED NATIONAL TEAMS ===
+Albania | FIFA World Cup Qualifying - UEFA | matches=9
+Albania | International Friendly | matches=3
+Albania | UEFA European Championship | matches=3
+Argentina | FIFA World Cup Qualifying - CONMEBOL | matches=10
+Argentina | Copa AmÚrica | matches=6
+Argentina | International Friendly | matches=6
+Argentina | FIFA World Cup | matches=4
+Austria | FIFA World Cup Qualifying - UEFA | matches=8
+Austria | FIFA World Cup | matches=4
+Austria | International Friendly | matches=4
+Austria | UEFA European Championship | matches=4
+Belgium | FIFA World Cup Qualifying - UEFA | matches=8
+Belgium | FIFA World Cup | matches=4
+Belgium | International Friendly | matches=4
+Belgium | UEFA European Championship | matches=4
+Brazil | FIFA World Cup Qualifying - CONMEBOL | matches=10
+Brazil | FIFA World Cup | matches=5
+Brazil | Copa AmÚrica | matches=4
+Brazil | International Friendly | matches=4
+Chile | FIFA World Cup Qualifying - CONMEBOL | matches=10
+Chile | International Friendly | matches=4
+Chile | Copa AmÚrica | matches=3
+Colombia | FIFA World Cup Qualifying - CONMEBOL | matches=10
+Colombia | Copa AmÚrica | matches=6
+Colombia | FIFA World Cup | matches=4
+Colombia | International Friendly | matches=4
+Croatia | FIFA World Cup Qualifying - UEFA | matches=8
+Croatia | FIFA World Cup | matches=4
+Croatia | International Friendly | matches=4
+Croatia | UEFA European Championship | matches=3
+Peru | FIFA World Cup Qualifying - CONMEBOL | matches=10
+Peru | International Friendly | matches=4
+Peru | Copa AmÚrica | matches=3
+
+=== POTENTIAL NAME COLLISIONS (team name reused with same id across many leagues) ===
+team_id=528 | Argentina | leagues=4
+team_id=559 | Austria | leagues=4
+team_id=556 | Belgium | leagues=4
+team_id=529 | Brazil | leagues=4
+team_id=525 | Colombia | leagues=4
+team_id=555 | Croatia | leagues=4
+team_id=536 | Albania | leagues=3
+team_id=586 | Chile | leagues=3
+team_id=530 | Peru | leagues=3

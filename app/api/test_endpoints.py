@@ -27,6 +27,7 @@ from sqlalchemy.orm import Session
 from app.api.dependencies import get_db
 from app.services.canonical_league_service import CanonicalLeagueService
 from app.services.prediction.backtesting_service import BacktestingService
+from app.services.prediction.league_strength_service import LeagueStrengthService
 from app.services.prediction.hyperparameter_optimization_service import (
     HyperparameterOptimizationService,
 )
@@ -148,7 +149,7 @@ def predict_match(
 
 @router.post("/backtest")
 def run_backtest(req: BacktestRequest, db: Session = Depends(get_db)) -> dict:
-    """Run walk-forward backtesting (read-only, no persistence)."""
+    """Run walk-forward backtesting and refresh data-driven league strength."""
     svc = BacktestingService(db, league_id=req.league_id)
     report = svc.run()
 
@@ -157,6 +158,9 @@ def run_backtest(req: BacktestRequest, db: Session = Depends(get_db)) -> dict:
             status_code=404,
             detail="No matches evaluated. Check league_id or data availability.",
         )
+
+    ls_report = LeagueStrengthService(db).recompute()
+    db.commit()
 
     return {
         "league_id": req.league_id,
@@ -169,6 +173,10 @@ def run_backtest(req: BacktestRequest, db: Session = Depends(get_db)) -> dict:
         "calibration": {
             label: {"predicted_avg": round(pavg, 3), "actual_freq": round(freq, 3), "count": cnt}
             for label, (pavg, freq, cnt) in sorted(report.calibration.items())
+        },
+        "league_strength": {
+            "leagues_updated": ls_report.leagues_updated,
+            "matches_used": ls_report.matches_used,
         },
     }
 
@@ -191,8 +199,11 @@ def run_rolling_retrain(req: RollingRetrainRequest, db: Session = Depends(get_db
     report = svc.run()
 
     invalidated = 0
+    ls_report = None
     if not req.dry_run:
+        ls_report = LeagueStrengthService(db).recompute()
         invalidated = PredictionService(db).invalidate_stale_predictions()
+        db.commit()
 
     return {
         "league_id": req.league_id,
@@ -204,6 +215,10 @@ def run_rolling_retrain(req: RollingRetrainRequest, db: Session = Depends(get_db
         "teams_updated": report.teams_updated,
         "params_clipped": report.params_clipped,
         "predictions_invalidated": invalidated,
+        "league_strength": {
+            "leagues_updated": ls_report.leagues_updated,
+            "matches_used": ls_report.matches_used,
+        } if ls_report is not None else None,
     }
 
 

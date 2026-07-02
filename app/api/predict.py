@@ -12,6 +12,7 @@ from app.repositories.prediction.model_repository import ModelRepository
 from app.repositories.prediction.prediction_repository import PredictionRepository
 from app.services.prediction.prediction_service import PredictionService
 from app.services.prediction.value_service import ValueService, odds_to_probs, compute_edge, compute_kelly_stake, compute_stake_rating
+from app.services.match_status import is_predictable_future_match
 
 router = APIRouter()
 
@@ -79,7 +80,7 @@ def upcoming(
     matches = MatchRepository(db).list_by_date_range(
         date_from=now, date_to=date_to, league_id=league_id,
     )
-    matches = [m for m in matches if m.status in ("SCHEDULED", "NS")]
+    matches = [m for m in matches if is_predictable_future_match(m.status)]
 
     model_rec = ModelRepository(db).get_by_name("dixon_coles_v1")
     pred_repo = PredictionRepository(db)

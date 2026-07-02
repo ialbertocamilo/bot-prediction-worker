@@ -3,6 +3,7 @@ from app.repositories.prediction.team_rating_repository import TeamRatingReposit
 from app.repositories.prediction.match_feature_repository import MatchFeatureRepository
 from app.repositories.prediction.prediction_repository import PredictionRepository
 from app.repositories.prediction.prediction_eval_repository import PredictionEvalRepository
+from app.repositories.prediction.league_strength_repository import LeagueStrengthRepository
 from app.repositories.prediction.market_odds_repository import MarketOddsRepository
 
 __all__ = [
@@ -11,5 +12,6 @@ __all__ = [
     "MatchFeatureRepository",
     "PredictionRepository",
     "PredictionEvalRepository",
+    "LeagueStrengthRepository",
     "MarketOddsRepository",
 ]

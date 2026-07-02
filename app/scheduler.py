@@ -33,6 +33,8 @@ SCHEDULER_ENABLED = os.getenv("SCHEDULER_ENABLED", "true").lower() in ("true", "
 SYNC_INTERVAL_HOURS = float(os.getenv("SCHEDULER_SYNC_HOURS", "6"))
 RETRAIN_INTERVAL_HOURS = float(os.getenv("SCHEDULER_RETRAIN_HOURS", "168"))  # 7 días
 BACKFILL_INTERVAL_HOURS = float(os.getenv("SCHEDULER_BACKFILL_HOURS", "12"))
+DATA_QUALITY_ENABLED = os.getenv("SCHEDULER_DATA_QUALITY_ENABLED", "true").lower() in ("true", "1", "yes")
+DATA_QUALITY_HOUR_UTC = int(os.getenv("SCHEDULER_DATA_QUALITY_HOUR", "3"))
 
 _scheduler: BackgroundScheduler | None = None
 
@@ -77,6 +79,7 @@ def _run_retrain_pipeline() -> None:
     """Rolling retrain + backtest sobre el dataset completo (todas las ligas)."""
     from app.db.session import SessionLocal
     from app.services.prediction.backtesting_service import BacktestingService
+    from app.services.prediction.league_strength_service import LeagueStrengthService
     from app.services.prediction.prediction_service import PredictionService
     from app.services.prediction.rolling_retrain_service import RollingRetrainService
 
@@ -101,6 +104,21 @@ def _run_retrain_pipeline() -> None:
         finally:
             db.close()
 
+        db = SessionLocal()
+        try:
+            ls_report = LeagueStrengthService(db).recompute()
+            db.commit()
+            logger.info(
+                "League strength tras retrain: %d ligas actualizadas (%d partidos)",
+                ls_report.leagues_updated,
+                ls_report.matches_used,
+            )
+        except Exception:
+            db.rollback()
+            logger.exception("Scheduler: error recalculando league_strength tras retrain")
+        finally:
+            db.close()
+
         # 2) Backtest — league_id=None evalúa dataset completo
         db = SessionLocal()
         try:
@@ -109,6 +127,21 @@ def _run_retrain_pipeline() -> None:
             logger.info("Backtest completado: %s", bt_report.summary()[:200])
         except Exception:
             logger.exception("Scheduler: error en backtest — continuando con invalidación")
+        finally:
+            db.close()
+
+        db = SessionLocal()
+        try:
+            ls_report = LeagueStrengthService(db).recompute()
+            db.commit()
+            logger.info(
+                "League strength tras backtest: %d ligas actualizadas (%d partidos)",
+                ls_report.leagues_updated,
+                ls_report.matches_used,
+            )
+        except Exception:
+            db.rollback()
+            logger.exception("Scheduler: error recalculando league_strength tras backtest")
         finally:
             db.close()
 
@@ -167,6 +200,29 @@ def _run_backfill_pipeline() -> None:
             logger.exception("Scheduler: error in raw_records purge setup")
 
         logger.info("✅ Scheduler: backfill completado")
+    finally:
+        _pipeline_lock.release()
+
+
+def _run_data_quality_audit() -> None:
+    from app.db.session import SessionLocal
+    from app.services.data_quality_service import DataQualityService
+
+    if not _pipeline_lock.acquire(blocking=False):
+        logger.warning("Scheduler: data quality audit skipped — another pipeline is running")
+        return
+
+    try:
+        db = SessionLocal()
+        try:
+            created = DataQualityService(db).run_and_persist()
+            db.commit()
+            logger.info("Data quality audit: %d issues created", created)
+        except Exception:
+            db.rollback()
+            logger.exception("Scheduler: error running data quality audit")
+        finally:
+            db.close()
     finally:
         _pipeline_lock.release()
 
@@ -234,6 +290,19 @@ def start_scheduler() -> None:
         coalesce=True,
         max_instances=1,
     )
+
+    if DATA_QUALITY_ENABLED:
+        _scheduler.add_job(
+            _run_data_quality_audit,
+            "cron",
+            hour=max(0, min(DATA_QUALITY_HOUR_UTC, 23)),
+            minute=0,
+            id="data_quality_audit",
+            name="Data quality audit",
+            misfire_grace_time=3600,
+            coalesce=True,
+            max_instances=1,
+        )
 
     _scheduler.start()
     

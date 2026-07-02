@@ -13,7 +13,14 @@ class Team(Base):
     short_name: Mapped[str | None] = mapped_column(String(80), nullable=True)
     country: Mapped[str | None] = mapped_column(String(80), nullable=True)
     founded_year: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    team_type: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="CLUB",
+        server_default="CLUB",
+    )
     domestic_league_key: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    national_team_key: Mapped[str | None] = mapped_column(String(50), nullable=True)
     crest_url: Mapped[str | None] = mapped_column(String(400), nullable=True)
 
     created_at: Mapped[object] = mapped_column(

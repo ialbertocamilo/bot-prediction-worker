@@ -48,7 +48,7 @@ from app.services.canonical_league_service import (
     background_ingest,
 )
 from app.services.prediction.prediction_service import PredictionService
-from app.services.prediction.value_service import ValueService, compute_kelly_stake, compute_stake_rating
+from app.services.prediction.value_service import ValueService
 from app.services.payments import (
     Gateway,
     MercadoPagoProvider,
@@ -59,6 +59,13 @@ from app.services.payments import (
 from app.services.payments.payment_service import CREDITS_PER_PURCHASE
 from app.repositories.core.user_repository import UserRepository
 from app.repositories.core.unlocked_match_repository import UnlockedMatchRepository
+from app.renderers.telegram import (
+    _esc,
+    _format_prediction,
+    _format_stake_analysis,
+    _format_value_bets,
+    _render_matches,
+)
 from app.services.voucher_service import redeem_voucher
 from config import PREDICTION_COST, CREDIT_PACKAGES  # , GEMINI_API_KEY
 
@@ -120,26 +127,6 @@ def _cache_set(chat_id: int, matches: list[Match]) -> None:
 
 def _db() -> Session:
     return SessionLocal()
-
-
-def _esc(text: str) -> str:
-    """Escape HTML special characters for Telegram."""
-    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-
-def _confidence_label(prob: float) -> str:
-    if prob >= 0.70:
-        return "🟢 Alta"
-    if prob >= 0.50:
-        return "🟡 Media"
-    if prob >= 0.35:
-        return "🟠 Baja"
-    return "🔴 Muy baja"
-
-
-def _pct(v: float) -> str:
-    """Format a probability as percentage string."""
-    return f"{v * 100:.1f}%"
 
 
 async def _safe_reply(update: Update, text: str, **kwargs) -> None:
@@ -249,144 +236,6 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "<i>Desarrollado con Dixon-Coles (1997) + calibración Platt + datos de 18 ligas.</i>"
     )
     await _safe_reply(update, msg, parse_mode="HTML", reply_markup=_main_menu_keyboard())
-
-
-# ── Callback query handler (inline buttons) ──────────────────────────────
-
-async def _callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Route inline-keyboard button presses to the right command."""
-    query = update.callback_query
-    await query.answer()  # Acknowledge immediately to stop loading spinner
-
-    # ── Per-user cooldown ─────────────────────────────────────────
-    user_id = update.effective_user.id if update.effective_user else 0
-    now = time.monotonic()
-    last = _user_cooldowns.get(user_id, 0.0)
-    if now - last < _USER_COOLDOWN_SECS:
-        return  # silently ignore spam clicks
-    _user_cooldowns[user_id] = now
-
-    data = query.data or ""
-    if data == "menu_leagues":
-        await _do_leagues(query.message, context)
-    elif data == "menu_matches":
-        await _do_matches(query.message, context, canonical_index=None)
-    elif data == "menu_valuebets":
-        await _do_valuebets(query.message, context)
-    elif data == "menu_comprar":
-        await _do_comprar_package_select(query, context)
-    elif data.startswith("buy_pack_"):
-        pack_id = data.removeprefix("buy_pack_")
-        pkg = next((p for p in CREDIT_PACKAGES if p["id"] == pack_id), None)
-        if pkg:
-            pen_price = pkg["prices"].get("PEN", 0)
-            await _safe_edit_or_send(
-                query.message,
-                f"🛒 <b>{pkg['credits']} créditos</b> — S/ {pen_price:.2f}\n\n"
-                f"Elige tu método de pago:",
-                parse_mode="HTML",
-                reply_markup=_gateway_keyboard_for_pack(pack_id),
-            )
-        else:
-            await _safe_edit_or_send(query.message, "⚠️ Paquete no encontrado.")
-    elif data.startswith("buy_mp_"):
-        pack_id = data.removeprefix("buy_mp_")
-        await _do_comprar_checkout(query, context, Gateway.MERCADOPAGO, pack_id)
-    elif data.startswith("buy_pp_"):
-        pack_id = data.removeprefix("buy_pp_")
-        await _do_comprar_checkout(query, context, Gateway.PAYPAL, pack_id)
-    elif data == "menu_back":
-        await _safe_edit_or_send(
-            query.message,
-            "📋 <b>Menú principal</b>\n\nElige una opción:",
-            parse_mode="HTML",
-            reply_markup=_main_menu_keyboard(),
-        )
-    elif data == "menu_saldo":
-        user = query.from_user
-        if user:
-            db = _db()
-            try:
-                repo = UserRepository(db)
-                balance: int = repo.get_creditos(user.id)
-                await _safe_edit_or_send(
-                    query.message,
-                    f"💰 <b>Tus créditos:</b> {balance}\n\n",
-                    # f"Usa /comprar para adquirir más.",
-                    parse_mode="HTML",
-                    reply_markup=_main_menu_keyboard(),
-                )
-            except Exception:
-                logger.exception("Error en menu_saldo para user %s", user.id)
-                await _safe_edit_or_send(query.message, "⚠️ Error al consultar créditos.")
-            finally:
-                db.close()
-    elif data == "menu_recargar":
-        await _do_comprar_package_select(query, context)
-    elif data == "menu_canjear":
-        await _safe_edit_or_send(
-            query.message,
-            "🎟️ Para canjear un pin, escribe el comando "
-            "/canjear seguido de tu código.\n\n"
-            "<b>Ejemplo:</b> <code>/canjear FQ-A1B2-C3D4-E5F6</code>",
-            parse_mode="HTML",
-            reply_markup=_main_menu_keyboard(),
-        )
-    elif data == "menu_ayuda":
-        await _safe_edit_or_send(
-            query.message,
-            "📖 <b>Guía Rápida</b>\n\n"
-            "<b>Flujo:</b> /leagues → /matches &lt;num&gt; → /predict &lt;num&gt;\n\n"
-            "📈 <b>Edge</b> = ventaja sobre el mercado\n"
-            "💰 <b>Stake</b> = % del bankroll (Kelly fraccionado)\n"
-            "🟢 Alta confianza · 🟡 Media · 🟠 Baja · 🔴 Muy baja",
-            parse_mode="HTML",
-            reply_markup=_main_menu_keyboard(),
-        )
-    elif data == "menu_help":
-        msg = (
-            "📖 <b>Guía Rápida</b>\n\n"
-            "<b>Flujo:</b> /leagues → /matches &lt;num&gt; → /predict &lt;num&gt;\n\n"
-            "📈 <b>Edge</b> = ventaja sobre el mercado\n"
-            "💰 <b>Stake</b> = % del bankroll (Kelly fraccionado)\n"
-            "🟢 Alta confianza · 🟡 Media · 🟠 Baja · 🔴 Muy baja"
-        )
-        await _safe_edit_or_send(query.message, msg, parse_mode="HTML", reply_markup=_main_menu_keyboard())
-    elif data.startswith("league_"):
-        idx = int(data.split("_", 1)[1])
-        await _do_matches(query.message, context, canonical_index=idx)
-    elif data == "predict_ask":
-        chat_id = query.message.chat_id
-        _awaiting_predict.add(chat_id)
-        # Send as a NEW message so the match list stays visible
-        await query.message.reply_text(
-            "🔮 <b>Predecir partido</b>\n\n"
-            "Escribe el <b>número</b> del partido que quieres predecir\n"
-            "(según la lista de arriba).\n\n"
-            "<i>También puedes usar el comando /predict &lt;número&gt;</i>",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[_BTN_MATCHES, _BTN_MENU]]),
-        )
-    elif data.startswith("odds_"):
-        match_id_str = data.split("_", 1)[1]
-        chat_id = query.message.chat_id
-        pending = _awaiting_odds.get(chat_id)
-        if pending and str(pending["match_id"]) == match_id_str:
-            await _safe_edit_or_send(
-                query.message,
-                "📝 <b>Ingresa las cuotas de tu casa de apuestas</b>\n\n"
-                "Envía los 3 valores separados por espacios:\n"
-                "<code>cuota_local cuota_empate cuota_visitante</code>\n\n"
-                "<i>Ejemplo: 1.85 3.40 4.50</i>",
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([[_BTN_MATCHES, _BTN_MENU]]),
-            )
-        else:
-            await _safe_edit_or_send(
-                query.message,
-                "⚠️ Predicción expirada. Usa /predict de nuevo.",
-                reply_markup=InlineKeyboardMarkup([[_BTN_MATCHES, _BTN_MENU]]),
-            )
 
 
 async def _safe_edit_or_send(message, text: str, **kwargs) -> None:
@@ -523,56 +372,6 @@ async def cmd_matches(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
 
     await _do_matches(update.message, context, canonical_index=canonical_index)
-
-
-def _render_matches(
-    upcoming: list[Match],
-    svc: CanonicalLeagueService,
-    filter_label: str = "",
-) -> str:
-    """Build HTML text for a list of matches."""
-    lines = [f"⚽ <b>Partidos{_esc(filter_label)}</b>\n"]
-    current_league = ""
-
-    for idx, m in enumerate(upcoming[:30], 1):
-        league_name = svc.display_name_for(m.league_id)
-        if league_name != current_league:
-            current_league = league_name
-            lines.append(f"\n🏆 <b>{_esc(league_name)}</b>")
-
-        home = _esc(m.home_team.name if m.home_team else "?")
-        away = _esc(m.away_team.name if m.away_team else "?")
-        rnd = f" (J{_esc(m.round)})" if m.round else ""
-
-        if m.status == "IN_PLAY":
-            clock = _esc(m.clock_display) if m.clock_display else "En vivo"
-            hg = m.home_goals if m.home_goals is not None else 0
-            ag = m.away_goals if m.away_goals is not None else 0
-            lines.append(
-                f"  <b>{idx}.</b> 🔴 <b>EN VIVO</b> ({clock})\n"
-                f"      {home} <b>{hg}</b> - <b>{ag}</b> {away}{rnd}"
-            )
-        elif m.status == "FINISHED":
-            hg = m.home_goals if m.home_goals is not None else "?"
-            ag = m.away_goals if m.away_goals is not None else "?"
-            lines.append(
-                f"  <b>{idx}.</b> ✅ <b>TERMINADO</b>\n"
-                f"      {home} <b>{hg}</b> - <b>{ag}</b> {away}{rnd}"
-            )
-        else:
-            date_str = m.utc_date.strftime("%d/%m %H:%M") if m.utc_date else "?"
-            lines.append(
-                f"  <b>{idx}.</b> ⏳ {date_str} UTC\n"
-                f"      {home} vs {away}{rnd}"
-            )
-
-    lines.append(
-        "\n<i>🔮 Toca <b>Predecir</b> o usa /predict &lt;número&gt;</i>"
-    )
-    text = "\n".join(lines)
-    if len(text) > 4000:
-        text = text[:3950] + "\n..."
-    return text
 
 
 async def _do_matches(
@@ -1158,184 +957,6 @@ async def cmd_predict(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         db.close()
 
 
-def _format_prediction(result) -> str:
-    """Build a clean, user-focused prediction message."""
-    home = _esc(result.home_team)
-    away = _esc(result.away_team)
-    p_h = result.p_home
-    p_d = result.p_draw
-    p_a = result.p_away
-
-    # Determine favorite
-    if p_h >= p_d and p_h >= p_a:
-        tip, conf = f"1 ({home})", p_h
-    elif p_a >= p_d:
-        tip, conf = f"2 ({away})", p_a
-    else:
-        tip, conf = "X (Empate)", p_d
-
-    lines = [
-        "━━━━━━━━━━━━━━━━━━━━━",
-        f"⚽ <b>{home}  vs  {away}</b>",
-        f"🏆 {_esc(result.league or '')}",
-    ]
-    if result.utc_date:
-        lines.append(f"🕐 {result.utc_date.strftime('%d/%m/%Y %H:%M')} UTC")
-
-    lines.append("━━━━━━━━━━━━━━━━━━━━━")
-
-    # ── Main prediction ──
-    lines.append(
-        f"\n🔮 <b>Predicción: {tip}</b>\n"
-        f"    {_confidence_label(conf)}  ({_pct(conf)})"
-    )
-
-    # ── 1X2 visual bar ──
-    bar_h = round(p_h * 20)
-    bar_d = round(p_d * 20)
-    bar_a = 20 - bar_h - bar_d
-    bar_a = max(0, bar_a)
-    lines.append(
-        f"\n📊 <b>Probabilidades 1X2</b>\n"
-        f"    🏠 {home}  <b>{_pct(p_h)}</b>  {'▓' * bar_h}{'░' * (20 - bar_h)}\n"
-        f"    🤝 Empate  <b>{_pct(p_d)}</b>  {'▓' * bar_d}{'░' * (20 - bar_d)}\n"
-        f"    ✈️ {away}  <b>{_pct(p_a)}</b>  {'▓' * bar_a}{'░' * (20 - bar_a)}"
-    )
-
-    # ── Over/Under ──
-    ou_parts: list[str] = []
-    if result.p_over_1_5 is not None:
-        ou_parts.append(f"O1.5 <b>{_pct(result.p_over_1_5)}</b>")
-    if result.p_over_2_5 is not None:
-        ou_parts.append(f"O2.5 <b>{_pct(result.p_over_2_5)}</b>")
-    if result.p_over_3_5 is not None:
-        ou_parts.append(f"O3.5 <b>{_pct(result.p_over_3_5)}</b>")
-    if ou_parts:
-        lines.append(f"\n⬆️ <b>Over/Under</b>\n    {' · '.join(ou_parts)}")
-
-    # ── BTTS ──
-    if result.p_btts_yes is not None:
-        lines.append(
-            f"\n🎯 <b>Ambos Anotan (BTTS)</b>\n"
-            f"    Sí <b>{_pct(result.p_btts_yes)}</b>  ·  "
-            f"No <b>{_pct(result.p_btts_no)}</b>"
-        )
-
-    # ── Double Chance ──
-    lines.append(
-        f"\n🔄 <b>Doble Oportunidad</b>\n"
-        f"    1X — {home} o Empate: <b>{_pct(result.p_1x)}</b>\n"
-        f"    X2 — {away} o Empate: <b>{_pct(result.p_x2)}</b>\n"
-        f"    12 — {home} o {away}: <b>{_pct(result.p_12)}</b>"
-    )
-
-    # ── Top scorelines ──
-    top = result.top_scorelines
-    if top:
-        scores = [f"<b>{s}</b> ({p}%)" for s, p in list(top.items())[:3]]
-        lines.append(f"\n🥅 <b>Marcadores más probables</b>\n    {', '.join(scores)}")
-
-    lines.append("━━━━━━━━━━━━━━━━━━━━━")
-    lines.append("<i>💡 Toca el botón de abajo para comparar con tus cuotas.</i>")
-
-    text = "\n".join(lines)
-    if len(text) > 4000:
-        text = text[:3950] + "\n..."
-    return text
-
-
-def _format_stake_analysis(
-    result,
-    home_odds: float,
-    draw_odds: float,
-    away_odds: float,
-) -> str:
-    """Build the stake analysis message after user provides odds."""
-    from app.services.prediction.value_service import odds_to_probs
-
-    home = _esc(result.home_team)
-    away = _esc(result.away_team)
-
-    market = odds_to_probs(home_odds, draw_odds, away_odds)
-
-    outcomes = [
-        ("1", home, result.p_home, home_odds, market["p_home"]),
-        ("X", "Empate", result.p_draw, draw_odds, market["p_draw"]),
-        ("2", away, result.p_away, away_odds, market["p_away"]),
-    ]
-
-    lines = [
-        "━━━━━━━━━━━━━━━━━━━━━",
-        f"💰 <b>Análisis de Cuotas</b>",
-        f"⚽ {home} vs {away}",
-        f"📊 Cuotas: <b>{home_odds:.2f}</b> / <b>{draw_odds:.2f}</b> / <b>{away_odds:.2f}</b>",
-        f"📉 Margen casa: <b>{market['margin'] * 100:.1f}%</b>",
-        "━━━━━━━━━━━━━━━━━━━━━",
-    ]
-
-    best_edge = -999.0
-    best_label = ""
-
-    for code, label, model_p, odds, market_p in outcomes:
-        ks = compute_kelly_stake(model_p, odds)
-        edge = ks["edge"]
-        stake_pct = ks["recommended_stake_percent"]
-        rating = compute_stake_rating(stake_pct)
-        stake_bar = "🟢" * rating + "⚪" * (10 - rating)
-
-        edge_sign = "+" if edge > 0 else ""
-        value_tag = " ✅ VALOR" if edge > 0.03 else ""
-
-        lines.append(
-            f"\n<b>{code} — {label}</b>  @{odds:.2f}\n"
-            f"    Modelo: <b>{_pct(model_p)}</b> vs Casa: <b>{_pct(market_p)}</b>\n"
-            f"    📈 Edge: <b>{edge_sign}{edge * 100:.1f}%</b>{value_tag}\n"
-            f"    🎯 Stake: {stake_bar} <b>{rating}/10</b>"
-        )
-        if stake_pct > 0:
-            lines.append(f"    💵 Apostar: <b>{stake_pct * 100:.2f}%</b> del bankroll")
-
-        if edge > best_edge:
-            best_edge = edge
-            best_label = f"{code} ({label})"
-
-    lines.append("\n━━━━━━━━━━━━━━━━━━━━━")
-    if best_edge > 0.03:
-        lines.append(
-            f"\n🏆 <b>Mejor apuesta: {best_label}</b>\n"
-            f"    Edge: <b>+{best_edge * 100:.1f}%</b> sobre la casa"
-        )
-    elif best_edge > 0:
-        lines.append(
-            f"\n⚠️ <b>Edge pequeño en {best_label}</b> ({best_edge * 100:.1f}%)\n"
-            f"    Considerar con precaución."
-        )
-    else:
-        lines.append(
-            "\n❌ <b>Sin valor detectado</b>\n"
-            "    Las cuotas no ofrecen ventaja. Mejor pasar."
-        )
-
-    # Glossary
-    lines.append(
-        "\n━━━━━━━━━━━━━━━━━━━━━"
-        "\n📖 <b>¿Qué significa cada dato?</b>\n"
-        "  📈 <b>Edge</b> — Ventaja del modelo sobre la casa de apuestas. "
-        "Si es positivo, la cuota paga más de lo que debería.\n"
-        "  🎯 <b>Stake</b> — Cuánto apostar según el criterio de Kelly. "
-        "Más 🟢 = más confianza en la apuesta.\n"
-        "  📉 <b>Margen casa</b> — Comisión implícita de la casa. "
-        "Cuanto menor, mejores cuotas te ofrecen.\n"
-        "  ✅ <b>VALOR</b> — Aparece cuando el edge supera 3%, "
-        "indicando una apuesta con ventaja real."
-    )
-
-    text = "\n".join(lines)
-    if len(text) > 4000:
-        text = text[:3950] + "\n..."
-    return text
-
-
 # ── /comprar ──────────────────────────────────────────────────────────────
 
 def _package_selection_keyboard() -> InlineKeyboardMarkup:
@@ -1588,58 +1209,6 @@ async def _do_valuebets(message, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
     finally:
         db.close()
-
-
-def _format_value_bets(bets: list[dict], db: Session) -> str:
-    """Build HTML message for top value bets."""
-    from app.repositories.football.match_repository import MatchRepository
-
-    repo = MatchRepository(db)
-    lines = ["📈 <b>Top Value Bets</b>\n"]
-
-    for i, bet in enumerate(bets, 1):
-        match = repo.get_by_id(bet["match_id"])
-        if not match:
-            continue
-
-        home = _esc(match.home_team.name if match.home_team else "?")
-        away = _esc(match.away_team.name if match.away_team else "?")
-        best = bet["best_value"]
-        outcome_map = {"home": f"1 ({home})", "draw": "X", "away": f"2 ({away})"}
-        outcome_label = outcome_map.get(best["outcome"], best["outcome"])
-        edge_pct = best["edge"] * 100
-
-        odds_data = bet["market_odds"]
-        date_str = match.utc_date.strftime("%d/%m %H:%M") if match.utc_date else ""
-
-        # Compute stake rating for the best outcome
-        outcome_key = best["outcome"]  # "home", "draw", "away"
-        model_p = bet["model_probabilities"][f"p_{outcome_key}"]
-        outcome_odds = odds_data[outcome_key]
-        ks = compute_kelly_stake(model_p, outcome_odds)
-        rating = compute_stake_rating(ks["recommended_stake_percent"])
-        stake_bar = "🟢" * rating + "⚪" * (10 - rating)
-
-        lines.append(
-            f"<b>{i}.</b> {home} vs {away}\n"
-            f"    🕐 {date_str} UTC\n"
-            f"    💰 Apuesta: <b>{outcome_label}</b>\n"
-            f"    📈 Edge: <b>+{edge_pct:.1f}%</b>\n"
-            f"    🎯 Stake: {stake_bar} <b>{rating}/10</b>\n"
-            f"    📊 Cuotas: {odds_data['home']:.2f} / {odds_data['draw']:.2f} / {odds_data['away']:.2f}\n"
-        )
-
-    lines.append(
-        "━━━━━━━━━━━━━━━━━━━━━\n"
-        "<i>📈 Edge = ventaja del modelo sobre el mercado\n"
-        "💰 Stake = % del bankroll (Kelly fraccionado 10%, tope 5%)\n"
-        "🟢 = unidad de stake recomendada</i>"
-    )
-
-    text = "\n".join(lines)
-    if len(text) > 4000:
-        text = text[:3950] + "\n..."
-    return text
 
 
 # ── Daily alert job ───────────────────────────────────────────────────────
@@ -1896,6 +1465,12 @@ async def _scheduled_hydration(context: ContextTypes.DEFAULT_TYPE) -> None:
 # ── main ──────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    import sys
+
+    from app.handlers.callbacks import _callback_handler, bind_bot_main
+
+    bind_bot_main(sys.modules[__name__])
+
     token = TELEGRAM_BOT_TOKEN
     if not token:
         logger.error("TELEGRAM_BOT_TOKEN no configurado en .env")

@@ -1,0 +1,99 @@
+=== TEAM SCHEMA ===
+id: integer
+name: character varying
+short_name: character varying
+country: character varying
+founded_year: integer
+created_at: timestamp with time zone
+domestic_league_key: character varying
+crest_url: character varying
+team_type: character varying
+national_team_key: character varying
+
+=== TEAM TYPE COUNTS ===
+CLUB: 774
+
+=== NATIONAL KEY COUNTS ===
+{'total': 774, 'with_national_key': 0, 'with_domestic_key': 378}
+
+=== INTERNATIONAL LEAGUES PRESENT IN DB ===
+league_id=37 | International Friendly | country=None | matches=315 | finished=315 | activeish=0
+league_id=36 | FIFA World Cup Qualifying - UEFA | country=None | matches=204 | finished=204 | activeish=0
+league_id=38 | FIFA World Cup | country=None | matches=104 | finished=79 | activeish=25
+league_id=40 | UEFA European Championship | country=None | matches=51 | finished=51 | activeish=0
+league_id=35 | FIFA World Cup Qualifying - CONMEBOL | country=None | matches=50 | finished=50 | activeish=0
+
+=== TEAMS USED IN INTERNATIONAL LEAGUES ===
+{'total_teams': 219, 'marked_national': 0, 'marked_club': 219, 'with_national_key': 0, 'with_domestic_key': 24}
+
+=== SAMPLE INTERNATIONAL TEAMS MISCLASSIFIED AS CLUB ===
+team_id=612 | Afghanistan | country=None | type=CLUB | domestic=None | national=None
+team_id=536 | Albania | country=None | type=CLUB | domestic=championship | national=None
+team_id=641 | Algeria | country=None | type=CLUB | domestic=None | national=None
+team_id=709 | American Samoa | country=None | type=CLUB | domestic=None | national=None
+team_id=534 | Andorra | country=None | type=CLUB | domestic=None | national=None
+team_id=765 | Angola | country=None | type=CLUB | domestic=None | national=None
+team_id=719 | Anguilla | country=None | type=CLUB | domestic=None | national=None
+team_id=528 | Argentina | country=None | type=CLUB | domestic=None | national=None
+team_id=581 | Armenia | country=None | type=CLUB | domestic=None | national=None
+team_id=712 | Aruba | country=None | type=CLUB | domestic=None | national=None
+team_id=632 | Australia | country=None | type=CLUB | domestic=None | national=None
+team_id=559 | Austria | country=None | type=CLUB | domestic=championship | national=None
+team_id=574 | Azerbaijan | country=None | type=CLUB | domestic=None | national=None
+team_id=718 | Bahamas | country=None | type=CLUB | domestic=None | national=None
+team_id=768 | Bahrain | country=None | type=CLUB | domestic=None | national=None
+team_id=601 | Bangladesh | country=None | type=CLUB | domestic=None | national=None
+team_id=721 | Barbados | country=None | type=CLUB | domestic=None | national=None
+team_id=572 | Belarus | country=None | type=CLUB | domestic=None | national=None
+team_id=556 | Belgium | country=None | type=CLUB | domestic=championship | national=None
+team_id=746 | Belize | country=None | type=CLUB | domestic=None | national=None
+team_id=735 | Benin | country=None | type=CLUB | domestic=None | national=None
+team_id=710 | Bermuda | country=None | type=CLUB | domestic=None | national=None
+team_id=763 | Bhutan | country=None | type=CLUB | domestic=None | national=None
+team_id=524 | Bolivia | country=None | type=CLUB | domestic=None | national=None
+team_id=726 | Bonaire | country=None | type=CLUB | domestic=None | national=None
+team_id=542 | Bosnia and Herzegovina | country=None | type=CLUB | domestic=None | national=None
+team_id=766 | Botswana | country=None | type=CLUB | domestic=None | national=None
+team_id=529 | Brazil | country=None | type=CLUB | domestic=None | national=None
+team_id=723 | British Virgin Islands | country=None | type=CLUB | domestic=None | national=None
+team_id=611 | Brunei Darussalam | country=None | type=CLUB | domestic=None | national=None
+team_id=563 | Bulgaria | country=None | type=CLUB | domestic=None | national=None
+team_id=769 | Burkina Faso | country=None | type=CLUB | domestic=None | national=None
+team_id=760 | Burundi | country=None | type=CLUB | domestic=None | national=None
+team_id=591 | Cambodia | country=None | type=CLUB | domestic=None | national=None
+team_id=729 | Cameroon | country=None | type=CLUB | domestic=None | national=None
+team_id=599 | Canada | country=None | type=CLUB | domestic=None | national=None
+team_id=636 | Cape Verde | country=None | type=CLUB | domestic=None | national=None
+team_id=722 | Cayman Islands | country=None | type=CLUB | domestic=None | national=None
+team_id=774 | Central African Republic | country=None | type=CLUB | domestic=None | national=None
+team_id=586 | Chile | country=None | type=CLUB | domestic=None | national=None
+team_id=728 | China | country=None | type=CLUB | domestic=None | national=None
+team_id=592 | Chinese Taipei | country=None | type=CLUB | domestic=None | national=None
+team_id=525 | Colombia | country=None | type=CLUB | domestic=None | national=None
+team_id=749 | Comoros | country=None | type=CLUB | domestic=None | national=None
+team_id=643 | Congo DR | country=None | type=CLUB | domestic=None | national=None
+team_id=704 | Costa Rica | country=None | type=CLUB | domestic=None | national=None
+team_id=555 | Croatia | country=None | type=CLUB | domestic=championship | national=None
+team_id=717 | Cuba | country=None | type=CLUB | domestic=None | national=None
+team_id=633 | Curacao | country=None | type=CLUB | domestic=None | national=None
+team_id=532 | Cyprus | country=None | type=CLUB | domestic=None | national=None
+
+=== TEAMS APPEARING BOTH IN INTERNATIONAL AND DOMESTIC COMPETITIONS ===
+team_id=528 | Argentina | type=CLUB | domestic=None | national=None
+team_id=524 | Bolivia | type=CLUB | domestic=None | national=None
+team_id=529 | Brazil | type=CLUB | domestic=None | national=None
+team_id=599 | Canada | type=CLUB | domestic=None | national=None
+team_id=586 | Chile | type=CLUB | domestic=None | national=None
+team_id=525 | Colombia | type=CLUB | domestic=None | national=None
+team_id=704 | Costa Rica | type=CLUB | domestic=None | national=None
+team_id=585 | Ecuador | type=CLUB | domestic=None | national=None
+team_id=703 | Jamaica | type=CLUB | domestic=None | national=None
+team_id=600 | Mexico | type=CLUB | domestic=None | national=None
+team_id=596 | Panama | type=CLUB | domestic=None | national=None
+team_id=526 | Paraguay | type=CLUB | domestic=None | national=None
+team_id=530 | Peru | type=CLUB | domestic=None | national=None
+team_id=696 | Quarterfinal 2 Winner | type=CLUB | domestic=None | national=None
+team_id=698 | Quarterfinal 4 Winner | type=CLUB | domestic=None | national=None
+team_id=595 | United States | type=CLUB | domestic=None | national=None
+team_id=531 | Uruguay | type=CLUB | domestic=None | national=None
+team_id=527 | Venezuela | type=CLUB | domestic=None | national=None

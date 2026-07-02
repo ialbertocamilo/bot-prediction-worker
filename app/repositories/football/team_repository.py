@@ -82,6 +82,8 @@ class TeamRepository:
         short_name: str | None = None,
         country: str | None = None,
         founded_year: int | None = None,
+        team_type: str = "CLUB",
+        national_team_key: str | None = None,
         crest_url: str | None = None,
     ) -> Team:
         team: Team = Team(
@@ -89,6 +91,8 @@ class TeamRepository:
             short_name=short_name,
             country=country,
             founded_year=founded_year,
+            team_type=team_type,
+            national_team_key=national_team_key,
             crest_url=crest_url,
         )
         self.db.add(team)
@@ -102,6 +106,8 @@ class TeamRepository:
         short_name: str | None = None,
         country: str | None = None,
         founded_year: int | None = None,
+        team_type: str = "CLUB",
+        national_team_key: str | None = None,
         crest_url: str | None = None,
     ) -> Team:
         team: Team | None = self.find_by_name_country(name=name, country=country)
@@ -109,6 +115,11 @@ class TeamRepository:
             # Update crest_url if missing and we have one now
             if crest_url and not team.crest_url:
                 team.crest_url = crest_url
+            if team_type and not team.team_type:
+                team.team_type = team_type
+            if national_team_key and not team.national_team_key:
+                team.national_team_key = national_team_key
+            if crest_url or national_team_key:
                 self.db.flush()
             return team
 
@@ -117,6 +128,8 @@ class TeamRepository:
             short_name=short_name,
             country=country,
             founded_year=founded_year,
+            team_type=team_type,
+            national_team_key=national_team_key,
             crest_url=crest_url,
         )
 

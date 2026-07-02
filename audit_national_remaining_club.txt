@@ -1,0 +1,25 @@
+team_id=695 | Quarterfinal 1 Winner | type=CLUB | domestic=None | national=None
+team_id=696 | Quarterfinal 2 Winner | type=CLUB | domestic=None | national=None
+team_id=697 | Quarterfinal 3 Winner | type=CLUB | domestic=None | national=None
+team_id=698 | Quarterfinal 4 Winner | type=CLUB | domestic=None | national=None
+team_id=232 | Round of 16 1 Winner | type=CLUB | domestic=None | national=None
+team_id=233 | Round of 16 2 Winner | type=CLUB | domestic=None | national=None
+team_id=234 | Round of 16 3 Winner | type=CLUB | domestic=None | national=None
+team_id=235 | Round of 16 4 Winner | type=CLUB | domestic=None | national=None
+team_id=236 | Round of 16 5 Winner | type=CLUB | domestic=None | national=None
+team_id=237 | Round of 16 6 Winner | type=CLUB | domestic=None | national=None
+team_id=238 | Round of 16 7 Winner | type=CLUB | domestic=None | national=None
+team_id=239 | Round of 16 8 Winner | type=CLUB | domestic=None | national=None
+team_id=690 | Round of 32 10 Winner | type=CLUB | domestic=None | national=None
+team_id=687 | Round of 32 11 Winner | type=CLUB | domestic=None | national=None
+team_id=688 | Round of 32 12 Winner | type=CLUB | domestic=None | national=None
+team_id=693 | Round of 32 13 Winner | type=CLUB | domestic=None | national=None
+team_id=691 | Round of 32 14 Winner | type=CLUB | domestic=None | national=None
+team_id=694 | Round of 32 15 Winner | type=CLUB | domestic=None | national=None
+team_id=692 | Round of 32 16 Winner | type=CLUB | domestic=None | national=None
+team_id=686 | Round of 32 8 Winner | type=CLUB | domestic=None | national=None
+team_id=689 | Round of 32 9 Winner | type=CLUB | domestic=None | national=None
+team_id=699 | Semifinal 1 Loser | type=CLUB | domestic=None | national=None
+team_id=701 | Semifinal 1 Winner | type=CLUB | domestic=None | national=None
+team_id=700 | Semifinal 2 Loser | type=CLUB | domestic=None | national=None
+team_id=702 | Semifinal 2 Winner | type=CLUB | domestic=None | national=None

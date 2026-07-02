@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import logging
 import math
+import unicodedata
+from difflib import SequenceMatcher
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
@@ -15,6 +17,7 @@ from app.db.models.football.match import Match
 from app.db.models.prediction.prediction import Prediction
 from app.repositories.football.match_repository import MatchRepository
 from app.repositories.prediction.league_hyperparams_repository import LeagueHyperparamsRepository
+from app.repositories.prediction.league_strength_repository import LeagueStrengthRepository
 from app.repositories.prediction.match_feature_repository import MatchFeatureRepository
 from app.repositories.prediction.model_repository import ModelRepository
 from app.repositories.prediction.prediction_repository import PredictionRepository
@@ -24,8 +27,23 @@ from app.repositories.prediction.prediction_eval_repository import PredictionEva
 from app.services.prediction.dixon_coles import DixonColesModel, DixonColesParams, MatchData
 from app.services.prediction.calibration import MultiClassPlattCalibrator, BinaryPlattCalibrator
 from app.services.prediction.schemas import MatchPredictionResult
-from app.services.canonical_league_service import domestic_key_for_league_name, strength_coefficient_for_key
-from config import HOME_ADVANTAGE, TIME_DECAY, XG_REG_WEIGHT, MIN_XG_MATCHES, CALIBRATION_ENABLED, CALIBRATION_MIN_SAMPLES, TRAINING_WINDOW_DAYS
+from app.services.match_status import PREDICTABLE_FUTURE_MATCH_STATUSES
+from app.services.canonical_league_service import (
+    LEAGUE_GROUPS,
+    CanonicalLeagueService,
+    domestic_key_for_league_name,
+)
+from config import (
+    CALIBRATION_ENABLED,
+    CALIBRATION_MIN_SAMPLES,
+    HOME_ADVANTAGE,
+    MIN_XG_MATCHES,
+    NATIONAL_MIN_MATCHES,
+    NATIONAL_TRAINING_WINDOW_DAYS,
+    TIME_DECAY,
+    TRAINING_WINDOW_DAYS,
+    XG_REG_WEIGHT,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +51,23 @@ MODEL_NAME = "dixon_coles_v1"
 MODEL_DESCRIPTION = "Dixon-Coles (1997) con corrección ρ y decaimiento temporal"
 MIN_MATCHES = 30
 MAX_ATTACK_DEFENSE = 5.0
+NATIONAL_COMPETITION_KEYS = {
+    "world-cup",
+    "wcq-conmebol",
+    "wcq-uefa",
+    "copa-america",
+    "euro",
+    "intl-friendly",
+}
+NATIONAL_FALLBACK_GROUPS: dict[str, tuple[str, ...]] = {
+    "world-cup": ("world-cup", "wcq-conmebol", "wcq-uefa", "copa-america", "euro", "intl-friendly"),
+    "wcq-conmebol": ("wcq-conmebol", "copa-america", "intl-friendly", "world-cup"),
+    "wcq-uefa": ("wcq-uefa", "euro", "intl-friendly", "world-cup"),
+    "copa-america": ("copa-america", "wcq-conmebol", "intl-friendly", "world-cup"),
+    "euro": ("euro", "wcq-uefa", "intl-friendly", "world-cup"),
+    "intl-friendly": ("intl-friendly", "world-cup", "wcq-conmebol", "wcq-uefa", "copa-america", "euro"),
+}
+NEUTRAL_NATIONAL_COMPETITION_KEYS = {"world-cup", "euro", "copa-america"}
 
 
 class PredictionService:
@@ -44,6 +79,7 @@ class PredictionService:
         self.feature_repo = MatchFeatureRepository(db)
         self.rating_repo = TeamRatingRepository(db)
         self.hp_repo = LeagueHyperparamsRepository(db)
+        self.league_strength_repo = LeagueStrengthRepository(db)
         self.eval_repo = PredictionEvalRepository(db)
         self._calibrators: dict[int | None, MultiClassPlattCalibrator] = {}
         self._ou25_calibrators: dict[int | None, BinaryPlattCalibrator] = {}
@@ -73,6 +109,20 @@ class PredictionService:
         if match is None:
             return None
 
+        home_type = self._team_type(match.home_team)
+        away_type = self._team_type(match.away_team)
+        if home_type == "NATIONAL" or away_type == "NATIONAL":
+            if home_type != "NATIONAL" or away_type != "NATIONAL":
+                logger.info(
+                    "National routing skipped for match %d — mixed team types "
+                    "(home=%s, away=%s)",
+                    match_id, home_type, away_type,
+                )
+                return None
+            from app.services.prediction.national_team_prediction_service import NationalTeamPredictionService
+
+            return NationalTeamPredictionService(self.db).predict_match(match_id, force=force)
+
         # ── Filtro de Fantasmas ───────────────────────────────────────────
         # Equipos sin domestic_league_key = datos insuficientes para predecir.
         home_key = getattr(match.home_team, "domestic_league_key", None)
@@ -99,22 +149,6 @@ class PredictionService:
         if not is_domestic:
             return self._predict_cross_league(match, home_key, away_key, force=force)
 
-        model_rec = self.model_repo.get_or_create(
-            name=MODEL_NAME,
-            description=MODEL_DESCRIPTION,
-        )
-    
-        existing = self.prediction_repo.latest_for_match_and_model(
-            match_id=match_id,
-            model_id=model_rec.id,
-        )
-        if existing is not None and not force:
-            return self._to_result(existing, match)
-
-        # Use the target match date as temporal reference (consistent with
-        # backtesting/rolling retrain).  Fall back to now for safety.
-        ref_ts = match.utc_date or datetime.now(timezone.utc)
-
         # ── Resolve sibling league_ids (season-split fix) ─────────────────
         # match_league_key is already resolved above (line ~95).  Use it to
         # fetch ALL league_ids that belong to the same canonical competition
@@ -123,110 +157,45 @@ class PredictionService:
         if not sibling_ids:
             sibling_ids = [match.league_id]
 
-        training = self._training_matches_multi(sibling_ids, match.id, before_date=ref_ts)
-        if len(training) < MIN_MATCHES:
-            return None
-
-        td, xg_w, ha = self._league_params(sibling_ids[0])
-        xg_map = self._load_xg_map([m.id for m in training])
-
-        from app.services.prediction.training_data import build_training_data
-        match_data, xg_priors = build_training_data(
-            training, ref_ts, td, xg_map, MIN_XG_MATCHES,
+        return self._predict_from_league_pool(
+            match,
+            sibling_ids,
+            force=force,
+            data_quality_prefix="club",
         )
 
-        if len(match_data) < MIN_MATCHES:
-            return None
+    def predict_national_match(
+        self,
+        match: Match,
+        *,
+        force: bool = False,
+    ) -> MatchPredictionResult | None:
+        """Predict a match between national teams using competition history.
 
-        dc = DixonColesModel(time_decay=td, home_adv_init=ha)
-        params = dc.fit(match_data, xg_priors=xg_priors, xg_weight=xg_w)
-        result = dc.predict_match(match.home_team_id, match.away_team_id, params)
-
-        model_id = model_rec.id
-        try:
-            self.feature_repo.upsert(
-                match_id=match_id,
-                model_id=model_id,
-                lambda_home=result["lambda_home"],
-                lambda_away=result["lambda_away"],
-                rating_home=result["attack_home"],
-                rating_away=result["attack_away"],
-                rating_diff=result["attack_home"] - result["attack_away"],
-                home_goals_for_avg=result["xg_home"],
-                home_goals_against_avg=None,
-                away_goals_for_avg=result["xg_away"],
-                away_goals_against_avg=None,
-            )
-
-            as_of = datetime.now(timezone.utc)
-            for tid in (match.home_team_id, match.away_team_id):
-                att = params.attack.get(tid, 0.0)
-                dfn = params.defense.get(tid, 0.0)
-                att = max(-MAX_ATTACK_DEFENSE, min(MAX_ATTACK_DEFENSE, att))
-                dfn = max(-MAX_ATTACK_DEFENSE, min(MAX_ATTACK_DEFENSE, dfn))
-                self.rating_repo.upsert_by_match(
-                    model_id=model_id,
-                    team_id=tid,
-                    as_of_match_id=match_id,
-                    rating=att - dfn,
-                    attack=att,
-                    defense=dfn,
-                    as_of_date=as_of,
-                )
-
-            # ── Platt calibration (optional post-processing) ──
-            cal = self._build_calibrator(league_id=match.league_id)
-            cal_home, cal_draw, cal_away = self._calibrate_1x2(
-                result["p_home"], result["p_draw"], result["p_away"],
-                league_id=match.league_id,
-            )
-
-            # Calibrate Over/Under 2.5 and BTTS via binary Platt scaling
-            cal_over_25, cal_under_25 = self._calibrate_ou25(
-                result["p_over_2_5"], result["p_under_2_5"],
-                league_id=match.league_id,
-            )
-            cal_btts_yes, cal_btts_no = self._calibrate_btts(
-                result["p_btts_yes"], result["p_btts_no"],
-                league_id=match.league_id,
-            )
-
-            prediction = self.prediction_repo.create(
-                match_id=match_id,
-                model_id=model_id,
-                p_home=cal_home,
-                p_draw=cal_draw,
-                p_away=cal_away,
-                p_over_1_5=result["p_over_1_5"],
-                p_under_1_5=result["p_under_1_5"],
-                p_over_2_5=cal_over_25,
-                p_under_2_5=cal_under_25,
-                p_over_3_5=result["p_over_3_5"],
-                p_under_3_5=result["p_under_3_5"],
-                p_btts_yes=cal_btts_yes,
-                p_btts_no=cal_btts_no,
-                xg_home=result["xg_home"],
-                xg_away=result["xg_away"],
-                top_scorelines=result["top_scorelines"],
-                data_quality=(
-                    f"{len(match_data)}_matches_{len(xg_priors)}_xg_teams"
-                    f"{'_calibrated' if cal.is_fitted else '_raw'}"
-                ),
-            )
-
-            self.db.flush()
-            return self._to_result(prediction, match)
-        except IntegrityError:
-            self.db.rollback()
-            match = self.match_repo.get_by_id(match_id)
-            if match is None:
-                return None
-            existing = self.prediction_repo.latest_for_match_and_model(
-                match_id, model_id,
-            )
-            if existing is not None:
-                return self._to_result(existing, match)
-            return None
+        National-team matches bypass ``domestic_league_key`` and instead train
+        on the current competition's historical pool (e.g. World Cup, WCQ,
+        Copa America, friendlies) resolved via canonical league aliases.
+        """
+        competition_key = self._competition_key_for_league_name(
+            match.league.name if match.league else None,
+        )
+        sibling_ids = self._resolve_league_ids_for_name(
+            match.league.name if match.league else None,
+            match.league_id,
+        )
+        fallback_ids = self._resolve_national_fallback_league_ids(competition_key)
+        return self._predict_from_league_pool(
+            match,
+            sibling_ids,
+            force=force,
+            data_quality_prefix="national",
+            min_matches=NATIONAL_MIN_MATCHES,
+            training_window_days=NATIONAL_TRAINING_WINDOW_DAYS,
+            fallback_league_ids=fallback_ids,
+            home_advantage_override=(
+                0.0 if competition_key in NEUTRAL_NATIONAL_COMPETITION_KEYS else None
+            ),
+        )
 
     # ── Platt calibration helpers ──────────────────────────────────────
 
@@ -418,8 +387,231 @@ class PredictionService:
         from app.services.prediction.training_data import load_xg_map
         return load_xg_map(self.db, match_ids)
 
+    @staticmethod
+    def _team_type(team) -> str:
+        raw = getattr(team, "team_type", "CLUB") if team is not None else "CLUB"
+        return str(raw or "CLUB").upper()
+
+    @staticmethod
+    def _normalize_name(value: str | None) -> str:
+        normalized = unicodedata.normalize("NFKD", value or "")
+        return "".join(ch for ch in normalized if not unicodedata.combining(ch)).lower().strip()
+
+    def _match_league_group(self, league_name: str | None):
+        if not league_name:
+            return None
+
+        normalized = self._normalize_name(league_name)
+        best_substring_group = None
+        best_substring_len = -1
+        best_fuzzy_group = None
+        best_fuzzy_score = 0.0
+
+        for group in LEAGUE_GROUPS:
+            for alias in group.league_names:
+                alias_normalized = self._normalize_name(alias)
+                if normalized == alias_normalized:
+                    return group
+                if alias_normalized and alias_normalized in normalized:
+                    if len(alias_normalized) > best_substring_len:
+                        best_substring_group = group
+                        best_substring_len = len(alias_normalized)
+                    continue
+
+                score = SequenceMatcher(None, normalized, alias_normalized).ratio()
+                if score >= 0.88 and score > best_fuzzy_score:
+                    best_fuzzy_group = group
+                    best_fuzzy_score = score
+
+        return best_substring_group or best_fuzzy_group
+
+    def _competition_key_for_league_name(self, league_name: str | None) -> str | None:
+        group = self._match_league_group(league_name)
+        return group.key if group is not None else None
+
+    def _resolve_league_ids_for_name(
+        self,
+        league_name: str | None,
+        fallback_league_id: int,
+    ) -> list[int]:
+        """Resolve DB league IDs by canonical league name aliases."""
+        if not league_name:
+            return [fallback_league_id]
+
+        svc = CanonicalLeagueService(self.db)
+        group = self._match_league_group(league_name)
+        if group is not None:
+            resolved = svc._resolved.get(group.key, [])
+            return resolved or [fallback_league_id]
+        return [fallback_league_id]
+
+    def _resolve_national_fallback_league_ids(self, competition_key: str | None) -> list[int]:
+        svc = CanonicalLeagueService(self.db)
+        keys = NATIONAL_FALLBACK_GROUPS.get(
+            competition_key or "",
+            tuple(sorted(NATIONAL_COMPETITION_KEYS)),
+        )
+        fallback_ids: list[int] = []
+        for key in keys:
+            fallback_ids.extend(svc._resolved.get(key, []))
+        # Preserve order while removing duplicates.
+        return list(dict.fromkeys(fallback_ids))
+
+    def _predict_from_league_pool(
+        self,
+        match: Match,
+        league_ids: list[int],
+        *,
+        force: bool = False,
+        data_quality_prefix: str = "club",
+        min_matches: int = MIN_MATCHES,
+        training_window_days: int = TRAINING_WINDOW_DAYS,
+        fallback_league_ids: list[int] | None = None,
+        home_advantage_override: float | None = None,
+    ) -> MatchPredictionResult | None:
+        match_id = match.id
+        model_rec = self.model_repo.get_or_create(
+            name=MODEL_NAME,
+            description=MODEL_DESCRIPTION,
+        )
+
+        existing = self.prediction_repo.latest_for_match_and_model(
+            match_id=match_id,
+            model_id=model_rec.id,
+        )
+        if existing is not None and not force:
+            return self._to_result(existing, match)
+
+        ref_ts = match.utc_date or datetime.now(timezone.utc)
+        training_ids = league_ids
+        training = self._training_matches_multi(
+            training_ids,
+            match.id,
+            before_date=ref_ts,
+            window_days=training_window_days,
+        )
+        training_source = "primary"
+        if len(training) < min_matches and fallback_league_ids:
+            deduped_fallback_ids = list(dict.fromkeys(fallback_league_ids))
+            if deduped_fallback_ids != training_ids:
+                training_ids = deduped_fallback_ids
+                training = self._training_matches_multi(
+                    training_ids,
+                    match.id,
+                    before_date=ref_ts,
+                    window_days=training_window_days,
+                )
+                training_source = "fallback"
+        if len(training) < min_matches:
+            return None
+
+        td, xg_w, ha = self._league_params(training_ids[0])
+        if home_advantage_override is not None:
+            ha = home_advantage_override
+        xg_map = self._load_xg_map([m.id for m in training])
+
+        from app.services.prediction.training_data import build_training_data
+        match_data, xg_priors = build_training_data(
+            training, ref_ts, td, xg_map, MIN_XG_MATCHES,
+        )
+        if len(match_data) < min_matches:
+            return None
+
+        dc = DixonColesModel(time_decay=td, home_adv_init=ha)
+        params = dc.fit(match_data, xg_priors=xg_priors, xg_weight=xg_w)
+        result = dc.predict_match(match.home_team_id, match.away_team_id, params)
+
+        model_id = model_rec.id
+        try:
+            self.feature_repo.upsert(
+                match_id=match_id,
+                model_id=model_id,
+                lambda_home=result["lambda_home"],
+                lambda_away=result["lambda_away"],
+                rating_home=result["attack_home"],
+                rating_away=result["attack_away"],
+                rating_diff=result["attack_home"] - result["attack_away"],
+                home_goals_for_avg=result["xg_home"],
+                home_goals_against_avg=None,
+                away_goals_for_avg=result["xg_away"],
+                away_goals_against_avg=None,
+            )
+
+            as_of = datetime.now(timezone.utc)
+            for tid in (match.home_team_id, match.away_team_id):
+                att = params.attack.get(tid, 0.0)
+                dfn = params.defense.get(tid, 0.0)
+                att = max(-MAX_ATTACK_DEFENSE, min(MAX_ATTACK_DEFENSE, att))
+                dfn = max(-MAX_ATTACK_DEFENSE, min(MAX_ATTACK_DEFENSE, dfn))
+                self.rating_repo.upsert_by_match(
+                    model_id=model_id,
+                    team_id=tid,
+                    as_of_match_id=match_id,
+                    rating=att - dfn,
+                    attack=att,
+                    defense=dfn,
+                    as_of_date=as_of,
+                )
+
+            cal = self._build_calibrator(league_id=match.league_id)
+            cal_home, cal_draw, cal_away = self._calibrate_1x2(
+                result["p_home"], result["p_draw"], result["p_away"],
+                league_id=match.league_id,
+            )
+            cal_over_25, cal_under_25 = self._calibrate_ou25(
+                result["p_over_2_5"], result["p_under_2_5"],
+                league_id=match.league_id,
+            )
+            cal_btts_yes, cal_btts_no = self._calibrate_btts(
+                result["p_btts_yes"], result["p_btts_no"],
+                league_id=match.league_id,
+            )
+
+            prediction = self.prediction_repo.create(
+                match_id=match_id,
+                model_id=model_id,
+                p_home=cal_home,
+                p_draw=cal_draw,
+                p_away=cal_away,
+                p_over_1_5=result["p_over_1_5"],
+                p_under_1_5=result["p_under_1_5"],
+                p_over_2_5=cal_over_25,
+                p_under_2_5=cal_under_25,
+                p_over_3_5=result["p_over_3_5"],
+                p_under_3_5=result["p_under_3_5"],
+                p_btts_yes=cal_btts_yes,
+                p_btts_no=cal_btts_no,
+                xg_home=result["xg_home"],
+                xg_away=result["xg_away"],
+                top_scorelines=result["top_scorelines"],
+                data_quality=(
+                    f"{data_quality_prefix}_{training_source}_{len(match_data)}_matches_"
+                    f"{len(xg_priors)}_xg_teams"
+                    f"{'_calibrated' if cal.is_fitted else '_raw'}"
+                )[:100],
+            )
+
+            self.db.flush()
+            return self._to_result(prediction, match)
+        except IntegrityError:
+            self.db.rollback()
+            match = self.match_repo.get_by_id(match_id)
+            if match is None:
+                return None
+            existing = self.prediction_repo.latest_for_match_and_model(
+                match_id, model_id,
+            )
+            if existing is not None:
+                return self._to_result(existing, match)
+            return None
+
     def _training_matches(
-        self, league_id: int, exclude_id: int, before_date: datetime | None = None,
+        self,
+        league_id: int,
+        exclude_id: int,
+        before_date: datetime | None = None,
+        *,
+        window_days: int = TRAINING_WINDOW_DAYS,
     ) -> list[Match]:
         stmt = (
             select(Match)
@@ -433,12 +625,17 @@ class PredictionService:
         )
         if before_date is not None:
             stmt = stmt.where(Match.utc_date < before_date)
-            window_start = before_date - timedelta(days=TRAINING_WINDOW_DAYS)
+            window_start = before_date - timedelta(days=window_days)
             stmt = stmt.where(Match.utc_date >= window_start)
         return list(self.db.scalars(stmt).all())
 
     def _training_matches_multi(
-        self, league_ids: list[int], exclude_id: int, before_date: datetime | None = None,
+        self,
+        league_ids: list[int],
+        exclude_id: int,
+        before_date: datetime | None = None,
+        *,
+        window_days: int = TRAINING_WINDOW_DAYS,
     ) -> list[Match]:
         """Fetch finished training matches across multiple league IDs."""
         if not league_ids:
@@ -455,7 +652,7 @@ class PredictionService:
         )
         if before_date is not None:
             stmt = stmt.where(Match.utc_date < before_date)
-            window_start = before_date - timedelta(days=TRAINING_WINDOW_DAYS)
+            window_start = before_date - timedelta(days=window_days)
             stmt = stmt.where(Match.utc_date >= window_start)
         return list(self.db.scalars(stmt).all())
 
@@ -483,7 +680,12 @@ class PredictionService:
         # Use first league_id for hyperparams (they share the same canonical group)
         td, xg_w, ha = self._league_params(league_ids[0])
 
-        training = self._training_matches_multi(league_ids, exclude_match_id, before_date)
+        training = self._training_matches_multi(
+            league_ids,
+            exclude_match_id,
+            before_date,
+            window_days=TRAINING_WINDOW_DAYS,
+        )
         if len(training) < MIN_MATCHES:
             logger.info(
                 "Cross-league: insufficient data for '%s' (%d < %d)",
@@ -511,6 +713,7 @@ class PredictionService:
         away_key: str,
         *,
         force: bool = False,
+        is_neutral_venue: bool = False,
     ) -> MatchPredictionResult | None:
         """Cross-league prediction: assemble lambdas from two domestic models.
 
@@ -556,7 +759,7 @@ class PredictionService:
 
         atk_h = params_home.attack.get(match.home_team_id, avg_att_h)
         def_h = params_home.defense.get(match.home_team_id, avg_def_h)
-        gamma = params_home.home_advantage
+        gamma = 0.0 if is_neutral_venue else params_home.home_advantage
 
         atk_a = params_away.attack.get(match.away_team_id, avg_att_a)
         def_a = params_away.defense.get(match.away_team_id, avg_def_a)
@@ -566,8 +769,8 @@ class PredictionService:
         lambda_away_base = math.exp(max(min(atk_a + def_h, 5), -20))
 
         # Strength coefficient adjustment
-        c_h = strength_coefficient_for_key(home_key)
-        c_a = strength_coefficient_for_key(away_key)
+        c_h = self.league_strength_repo.get_coefficient(home_key)
+        c_a = self.league_strength_repo.get_coefficient(away_key)
         ratio_h = c_h / c_a if c_a > 0 else 1.0
         ratio_a = c_a / c_h if c_h > 0 else 1.0
 
@@ -681,7 +884,7 @@ class PredictionService:
             return None
 
     def invalidate_stale_predictions(self) -> int:
-        """Delete cached predictions for SCHEDULED matches so they get regenerated.
+        """Delete cached predictions for future predictable matches so they regenerate.
 
         Called after rolling retrain or optimize_model to ensure predictions
         reflect the latest model parameters.  Returns count of deleted rows.
@@ -691,7 +894,7 @@ class PredictionService:
 
         subq = (
             select(Match.id)
-            .where(Match.status == "SCHEDULED")
+            .where(Match.status.in_(PREDICTABLE_FUTURE_MATCH_STATUSES))
             .where(Match.utc_date >= datetime.now(timezone.utc))
             .scalar_subquery()
         )
@@ -706,7 +909,7 @@ class PredictionService:
         return count
 
     def invalidate_league_predictions(self, league_id: int) -> int:
-        """Delete cached predictions for future SCHEDULED matches in a league.
+        """Delete cached predictions for future predictable matches in a league.
 
         Called when new finished results are ingested so that future
         predictions are regenerated with the updated training data.
@@ -719,7 +922,7 @@ class PredictionService:
         subq = (
             select(Match.id)
             .where(Match.league_id == league_id)
-            .where(Match.status.in_(("SCHEDULED", "NS")))
+            .where(Match.status.in_(PREDICTABLE_FUTURE_MATCH_STATUSES))
             .where(Match.utc_date >= datetime.now(timezone.utc))
             .scalar_subquery()
         )

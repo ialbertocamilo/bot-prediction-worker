@@ -13,6 +13,10 @@ TIME_DECAY = float(os.getenv("TIME_DECAY", "0.007"))
 # Only matches within this window before the target date are used.
 TRAINING_WINDOW_DAYS = int(os.getenv("TRAINING_WINDOW_DAYS", "365"))
 
+# National-team matches are sparser than club leagues, so they use a longer
+# history window and can fit with fewer finished matches.
+NATIONAL_TRAINING_WINDOW_DAYS = int(os.getenv("NATIONAL_TRAINING_WINDOW_DAYS", "1460"))
+
 # xG regularization weight for Dixon-Coles attack/defense priors.
 # Higher values pull parameters more toward xG-implied strengths.
 # 7.5 = strong xG prior.  Optimized via grid search on EPL 2024-26 (LL=1.0037).
@@ -21,6 +25,10 @@ XG_REG_WEIGHT = float(os.getenv("XG_REG_WEIGHT", "7.5"))
 # Minimum xG-tracked matches a team needs before its xG prior is used.
 # Prevents noisy priors from teams with very few xG data points.
 MIN_XG_MATCHES = int(os.getenv("MIN_XG_MATCHES", "3"))
+
+# Club competitions keep the original threshold; national teams need a lower
+# floor because tournaments and qualifiers are much less dense.
+NATIONAL_MIN_MATCHES = int(os.getenv("NATIONAL_MIN_MATCHES", "12"))
 
 # Dixon-Coles home-advantage value (fixed during fitting via home_adv_fixed=True).
 # 0.18 = moderate home edge.  Optimized via grid search on EPL 2024-26 (LL=1.0037).

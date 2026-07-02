@@ -1,0 +1,22 @@
+=== TEAM TYPE COUNTS AFTER BACKFILL ===
+CLUB: 580
+NATIONAL: 194
+
+=== NATIONAL KEY COUNTS AFTER BACKFILL ===
+{'total': 774, 'with_national_key': 194, 'with_domestic_key': 354, 'national_teams': 194}
+
+=== FOCUS TEAMS ===
+team_id=528 | Argentina | type=NATIONAL | domestic=None | national=argentina
+team_id=559 | Austria | type=NATIONAL | domestic=None | national=austria
+team_id=556 | Belgium | type=NATIONAL | domestic=None | national=belgium
+team_id=529 | Brazil | type=NATIONAL | domestic=None | national=brazil
+team_id=586 | Chile | type=NATIONAL | domestic=None | national=chile
+team_id=525 | Colombia | type=NATIONAL | domestic=None | national=colombia
+team_id=555 | Croatia | type=NATIONAL | domestic=None | national=croatia
+team_id=530 | Peru | type=NATIONAL | domestic=None | national=peru
+
+=== INTERNATIONAL TEAMS STILL MARKED AS CLUB ===
+{'remaining_club': 25}
+
+=== INTERNATIONAL TEAMS STILL WITH DOMESTIC KEY ===
+{'remaining_domestic_key': 0}

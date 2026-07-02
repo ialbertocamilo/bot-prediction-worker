@@ -5,5 +5,6 @@ from app.db.models.core.user import User
 from app.db.models.core.payment import Payment
 from app.db.models.core.credit_voucher import CreditVoucher
 from app.db.models.core.unlocked_match import UnlockedMatch
+from app.db.models.core.data_quality_report import DataQualityReport
 
-__all__ = ["Source", "ExternalId", "RawRecord", "User", "Payment", "CreditVoucher", "UnlockedMatch"]
+__all__ = ["Source", "ExternalId", "RawRecord", "User", "Payment", "CreditVoucher", "UnlockedMatch", "DataQualityReport"]
